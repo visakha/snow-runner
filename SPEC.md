@@ -1,0 +1,514 @@
+# snow-runner — Orchestrator Spec (v0.1 DRAFT — for review, no code yet)
+
+> Status: **spec-first**. This document is the design to be argued about
+> over the next few sessions. **No application code is written until this
+> spec is approved.** Nothing in here changes a stored procedure, a loader,
+> a pass, or a view. The Snowflake estate stays exactly as it is; this
+> application only *calls* it, in the right order, with management control
+> around the calls.
+
+## 1. Purpose
+
+**snow-runner** is a Java Spring Boot application that runs the Snowflake
+ETL we have built (the spine-first Common-CS v3 line) as a managed
+workflow. It is invoked by an **external scheduler** and does one job:
+
+1. Take a run request (a source, or all sources).
+2. Call the Snowflake stored procedures for that source **in the correct
+   sequence**, with the correct run-scoped parameters.
+3. Record what happened — per step, per run — so a run can be inspected,
+   resumed, and debugged from an IDE instead of from inside Snowflake.
+
+### Why Java, why now
+
+- **Management control.** A scheduler plus stored procedures gives you
+  "it ran / it failed". It does not give you per-mapping status, resume
+  from the failed mapping, run history you can query, or a preflight that
+  says *which* object is missing before anything runs.
+- **Debuggability.** A failed mapping inside a 40-mapping runner is a
+  summary string. The same mapping as one step in Java is a step row with
+  a start time, an end time, a Snowflake query id, and the procedure's own
+  output — reproducible from the IDE against a scratch schema.
+- **No Snowflake scheduler components.** The estate deliberately uses
+  only stored procedures, views, and functions — no Tasks, Streams, or
+  Dynamic Tables (licensing). The scheduler and the sequencing live
+  outside Snowflake, in this application, where they are versioned,
+  reviewed, and tested like any other code.
+
+### Non-goals (hard boundaries)
+
+- **It does not replace any stored procedure.** No loader logic, no
+  enrichment, no EXC/DQM pass logic moves into Java. If a transformation
+  needs changing, it changes in Snowflake, not here.
+- **It does not reimplement ETL logic in Java.** Java owns *sequencing,
+  invocation, parameters, status, and recovery*. It never builds SQL
+  strings for ETL work, never reflects over procedures, and never invents
+  a mini-ORM. (Same code taste as the rest of the estate: typed models,
+  explicit repositories, named SQL constants, injected dependencies,
+  Spring Data JDBC — no JPA-style magic.)
+- **It does not orchestrate the Compare tool or the test-harness pipeline
+  in v0.1.** Those are separate systems with their own runners. v0.1 is
+  the ETL only. Extending to Compare runs later is a scope decision, not
+  an accident.
+- **It does not run the MDM batch.** The batch is the owning team's code
+  and stays outside this application. (The VIEW-CUTOVER package already
+  established that the batch moves to `V_MDM_*` views on its own track.)
+- **It does not validate dependencies.** This is the standing rule from
+  the step-driver work: the operator toggles what runs; dependency
+  correctness is the operator's responsibility. The engine runs enabled
+  steps in catalog order and reports a missing object plainly — it never
+  silently enforces, reorders, or "fixes" the configuration.
+
+## 2. The estate it orchestrates (one page)
+
+Six sources, Member domain only: **TRS, ECI, FSS, WIC, TTF, CRE**.
+
+The v3 tree (`snowflake_common_cs_v3_trs_dqm`, with the TYPE-FIX line as
+a separate patched copy) contains, per source:
+
+- **Mapping drivers** — 40 in total across sources (`drivers/`,
+  `sp_snow_main_m_Tgt_C_S_*`). Each driver loads one mapping's targets
+  (party, address, phone, alt-id, relationship, plan, TOA, validation,
+  deactivation, and the CRE care-clients mapping).
+- **Workflow runners** — 7 in total (`runners/`,
+  `sp_etl_run_wf_*_Stage_Load*`). TRS has two (Ongoing, TOA); every
+  other source has one. A runner calls that workflow's drivers **in
+  order, with zero arguments** (all driver parameters carry defaults),
+  captures each driver's summary string, and returns one combined
+  summary string.
+- **Common passes** (`02_common`) — enrichment, EXC, and DQM passes
+  shared across sources, called from the drivers.
+- **Flag model** — every C_S_* row carries spine-stage and non-spine
+  stage flags (Y = filtered out / failed, N = passed, reason NULL when
+  N). Views (`V_MDM_*`, `V_CMP_*`, `V_AUDIT_*`) enforce predicates; the
+  orchestrator never filters rows itself.
+- **Run timestamp** — loaders, enrich passes, and EXC/DQM passes are
+  run-scoped by `P_RUN_TS` (run filters use
+  `LAST_UPDATE_DATE IN (run_ts, run_ts - 1h)` to preserve end-dated
+  timeline semantics).
+
+Restart semantics already established in the estate, which this spec
+preserves rather than redesigns:
+
+- **Mapping-level restart only.** A restart is a new run: the mapping, at
+  its start, drops work tables the previous run left behind, then runs
+  every step from scratch. Work tables are **never dropped at the end**
+  of a run — they are left standing for inspection.
+- **Insert-only with guards.** Re-running a loader inserts nothing
+  twice (unique-key guards); it does not undo what an earlier run
+  already published. EXC passes carry a `NOT EXISTS` guard and are
+  idempotent on re-run.
+- **One known exception: DQM passes append.** `DQM_ADDRESS` has no
+  `NOT EXISTS` guard, so re-running a DQM pass duplicates rows. This is
+  a deliberate, documented limitation (DQM-RERUN: no code fix wanted).
+  The orchestrator must therefore never blindly re-run a DQM step — see
+  §6.
+
+## 3. The central design decision: granularity
+
+There are exactly two honest ways for Java to invoke this estate:
+
+### Option A — Runner-level (7 CALLs)
+
+Java calls one workflow runner per source (`CALL
+sp_etl_run_wf_TRS_Stage_Load_1_Ongoing()`, etc.) and records the
+returned summary string.
+
+- Pros: smallest possible Java surface; the order already exists in
+  Snowflake and cannot drift from it; one CALL per source.
+- Cons: **opaque**. A failure inside mapping 12 of 15 is one failed
+  CALL with a summary string — no per-mapping status, no resume from
+  mapping 12, no per-mapping duration. And the runners call drivers
+  with **zero arguments**, so Java cannot supply an explicit run
+  timestamp (see §5) — every step would fall back to whatever default
+  the driver carries, and a run's steps would no longer share one
+  `P_RUN_TS`.
+
+### Option B — Driver-level (40 steps, grouped by workflow) — RECOMMENDED
+
+Java calls each mapping driver directly, in the same order the runner
+uses, grouped under its workflow. The runner's order becomes the step
+catalog (§4), owned and versioned in this repo.
+
+- Pros: this is the whole point of the application — per-mapping
+  status, duration, query id, and output; resume from the failed
+  mapping; a single mapping re-runnable from the IDE; an explicit
+  `P_RUN_TS` passed to every step so a run is genuinely run-scoped.
+- Cons: Java now owns a copy of the order. If a runner's order changes
+  in Snowflake, the catalog must change with it. Mitigation: the
+  catalog is generated/verified against the installed runners by the
+  preflight check (§7), so drift is detected before a run, not during
+  one.
+
+**Recommendation: Option B.** Option A saves a small amount of Java
+code and gives up exactly the management control and debuggability the
+application exists for. If review disagrees, Option A is still viable —
+but then the run-timestamp problem in §5 must be solved another way
+(e.g. new runner signatures that accept `P_RUN_TS`), which is a
+Snowflake change, not a Java one.
+
+## 4. The step catalog (source of truth for order)
+
+A **step** is one stored-procedure CALL: a procedure name, its schema,
+its parameters, and its position in a workflow. A **workflow** is an
+ordered list of steps for one source (TRS Ongoing, TRS TOA, ECI, FSS,
+WIC, TTF, CRE).
+
+### Where the catalog lives — options
+
+1. **YAML in this repo (RECOMMENDED for v0.1).** One file per source,
+   reviewed in pull requests, diffed like code, versioned with the app.
+   Toggles (`enabled: true/false`) live in the same file.
+2. **A database table, on the ETL_RUN_CONFIG_TBL precedent.** The
+   earlier step-driver design used a COMMON-schema config table with
+   `is_driver / is_run_enabled / is_dependent / dependent_on` and the
+   operator toggling only `is_run_enabled`. That works, but it puts
+   run configuration in a table that itself needs deploying, and it
+   splits the order across two systems (repo + table).
+3. **Derived at startup from the installed runners.** Java reads the
+   runner procedure bodies and extracts the CALL order. Clever, fragile,
+   and a parsing dependency on Snowflake SQL text — rejected for v0.1.
+
+**Recommendation: YAML in the repo for v0.1**, with the table-backed
+option kept open if operations later wants toggles changeable without a
+redeploy. Either way, the rule from §1 stands: the engine executes
+enabled steps in catalog order. It does not validate dependencies, does
+not reorder, and does not skip a disabled step's downstream dependents
+on the operator's behalf — a disabled step is simply not called, and
+the run record shows it as SKIPPED.
+
+### Catalog contents (per step)
+
+- Workflow, position, procedure name, schema/database.
+- Parameters: which are run-scoped (`P_RUN_TS`, `P_SOURCE`) vs fixed.
+- Rerun-safety class (§6): `SAFE` (loader / EXC pass — guards make
+  re-runs idempotent) vs `APPEND` (DQM pass — re-running duplicates).
+- Timeout for the step (see §8: a CRE loader run has been observed
+  taking ~15 minutes on scratch; timeouts must be per-step, generous,
+  and never global-default).
+
+### Catalog versioning
+
+Every run records three versions: the **application version**, the
+**step-catalog version** (git commit of the catalog), and the
+**Snowflake tree version** the procedures came from (base v3 vs the
+TYPE-FIX line — these are separate lines until adopted, and a run must
+say which one it called). A run record that cannot name its catalog and
+its Snowflake tree is not debuggable and is not acceptable.
+
+## 5. Run-scoped parameters: Java owns P_RUN_TS
+
+This is the sharpest detail in the spec, and the reason Option A fails:
+
+- Java generates **one `P_RUN_TS` per run** (a single timestamp, at run
+  start) and passes it explicitly to **every** step CALL in that run.
+- Rationale: loaders, enrich passes, and EXC/DQM passes all filter on
+  `LAST_UPDATE_DATE IN (run_ts, run_ts - 1h)`. If each step defaulted
+  its own timestamp, steps in one run would disagree about which rows
+  belong to the run, and end-dated rows (the −1h leg) would be
+  misattributed. One run, one timestamp, passed explicitly.
+- `P_SOURCE` is passed explicitly per workflow for the same reason —
+  no step may rely on a default for its source identity.
+- A resumed run (§6) **reuses the original run's `P_RUN_TS`**. A resume
+  is a continuation of the same run, not a new run: new timestamps
+  would strand the already-loaded rows outside the resumed steps'
+  filters. A full re-run (as opposed to a resume) generates a fresh
+  `P_RUN_TS`.
+
+## 6. Execution semantics
+
+### One run
+
+1. Scheduler triggers a run (CLI or REST, §9–§10) for one source, or
+   for all sources.
+2. Java creates a run record (status QUEUED → RUNNING), generates
+   `P_RUN_TS`, and runs the preflight (§7).
+3. Steps execute **sequentially within a workflow**, in catalog order.
+   Across sources, v0.1 runs workflows **sequentially** too (see below).
+4. Each step CALL captures: start/end time, Snowflake query id, the
+   procedure's returned summary string, and status (SUCCEEDED / FAILED).
+5. On step failure: the run stops (**fail-fast**, per workflow). The
+   run record shows exactly which step failed, with the Snowflake error
+   verbatim. No silent retries: a CALL that may have partially written
+   must never be auto-retried — the operator decides, via resume or
+   re-run, with the rerun-safety facts in front of them.
+6. The run ends SUCCEEDED only when every enabled step succeeded.
+   Disabled steps are recorded as SKIPPED, never as success.
+
+### Resume vs re-run (distinct operations, both first-class)
+
+- **Resume** (`POST /runs/{id}/resume`, CLI `resume`): re-runs the same
+  run id, reuses the original `P_RUN_TS`, and executes only steps that
+  are not already SUCCEEDED — starting from the first FAILED step.
+  This is what makes the DQM-append limitation safe: a SUCCEEDED DQM
+  step is never re-executed by a resume, so no duplicates are created
+  by recovery. A resume that re-ran SUCCEEDED steps would be a bug,
+  not a feature.
+- **Re-run** (new run id, fresh `P_RUN_TS`): runs everything from
+  scratch, relying on the estate's mapping-level restart semantics
+  (work tables dropped at mapping start, insert-only guards). A re-run
+  of a workflow that already published is *not* undone — the operator
+  must understand that before re-running, and the CLI/REST response
+  should say so when a re-run targets a source with a recent SUCCEEDED
+  run.
+
+### Parallelism
+
+Sources are independent schemas and could run concurrently, but v0.1
+runs them **sequentially**. Reasons: one warehouse's load is easier to
+reason about; a failure in one source does not interleave with another
+source's logs; and the observed loader durations (minutes, not
+seconds) make wall-clock savings from parallelism small against the
+debugging cost. Parallel execution across sources is a later,
+explicitly-approved change, not a default to discover in production.
+
+### Cancellation
+
+Cancel stops the run from issuing further step CALLs and marks the run
+CANCELLED with the last completed step recorded. It does **not** kill
+an in-flight CALL (Snowflake CALL cancellation is a separate,
+deliberate operation the operator performs knowingly) and it does
+**not** roll anything back — the estate has no rollback, and Java must
+not pretend otherwise. A cancelled run can be resumed like a failed
+one.
+
+## 7. Preflight (before the first CALL)
+
+Before any step executes, Java verifies the run *can* execute, and
+fails plainly if it cannot:
+
+- Every enabled step's procedure **exists** in the target
+  schema/database (a `SHOW PROCEDURES` / `INFORMATION_SCHEMA` check).
+  A missing procedure fails the run before anything is called, naming
+  the missing objects — missing objects are flagged, never invented,
+  and never worked around.
+- The target schemas are reachable with the configured role/warehouse.
+- The step catalog version and Snowflake tree version are recorded on
+  the run (see §4).
+- Optional `--dry-run` mode: print the ordered step list with
+  parameters and stop — no CALLs, no run record (or a DRY_RUN record,
+  TBD in review). This is the operator's "show me what you would do"
+  command and should be the first thing demonstrated in the IDE.
+
+Preflight is a *read-only* check. It does not create tables, does not
+alter anything, and does not "fix" a missing procedure by substituting
+another.
+
+## 8. Snowflake connectivity
+
+- **Driver:** `snowflake-jdbc`, via Spring Boot's datasource
+  auto-configuration with HikariCP. Sequential execution means a small
+  pool is correct — do not size for concurrency the engine does not
+  have.
+- **Authentication: key-pair (RECOMMENDED).** The estate already uses
+  key-pair auth (private key file, `private_key_file` parameter —
+  note: `private_key_path` fails on the Python connector; the JDBC
+  equivalent parameter must be verified in implementation, not
+  assumed). The private key path is configuration, never committed to
+  the repo, never logged. Password auth via a vault is the fallback,
+  not the default.
+- **Session:** role, warehouse, and per-source database/schema come
+  from environment profiles (dev / prod), never from code. One
+  connection per step CALL is acceptable; a session reused across a
+  run must be re-validated after a failure.
+- **CALL mechanics:** `CALL schema.procedure(?, ?)` with bound
+  parameters (never string-built SQL — the estate has repeatedly
+  rejected dynamic-SQL cleverness, and Java must not reintroduce it).
+  Capture the returned VARCHAR summary and the Snowflake query id
+  (for `QUERY_HISTORY` correlation) on every step.
+- **Timeouts:** per-step, generous. Loader runs in the minutes-to-
+  ~15-minutes range have been observed; a global default timeout that
+  kills a healthy long CALL would be a self-inflicted failure mode.
+  The scheduler's own timeout must exceed the longest step's timeout —
+  this is a deployment checklist item, not a code default.
+
+## 9. REST API (operations surface)
+
+Base: `/api/v1`. All responses carry the run id and the three versions
+from §4.
+
+| Method & path | Purpose |
+|---|---|
+| `POST /runs` `{source, mode}` | Start a run. `source`: TRS/ECI/FSS/WIC/TTF/CRE or ALL. `mode`: FULL or RESUME-of-a-run-id (see below). Returns `202` + run id. |
+| `GET /runs/{id}` | Run status, timings, versions, per-step summary. |
+| `GET /runs/{id}/steps` | Per-step rows: procedure, status, start/end, query id, output summary. |
+| `POST /runs/{id}/resume` | Resume a FAILED/CANCELLED run (§6). |
+| `POST /runs/{id}/cancel` | Cancel a RUNNING run (§6). |
+| `GET /runs?source=&status=` | Run history, filterable. |
+| `GET /health` | Liveness + Snowflake reachability (read-only check, no CALL). |
+
+- **Idempotency:** the scheduler retries. A `POST /runs` carries a
+  client-supplied idempotency key (or the scheduler's own job id); a
+  repeat with the same key returns the original run instead of starting
+  a second one. Without this, a scheduler retry after a network
+  timeout becomes a duplicate run — and a duplicate run is a second
+  publication, not a harmless repeat.
+- **Auth (open question, §13):** v0.1 needs *something* — an API key
+  for the scheduler is the minimal honest answer; SSO comes later if
+  the deployment requires it. An unauthenticated trigger endpoint is
+  not acceptable even on an internal network.
+- **Errors:** a step failure is a run failure, not an HTTP 500
+  mystery. `GET /runs/{id}` returns the failed step and the verbatim
+  Snowflake error; the HTTP layer reports run state, it does not hide
+  it.
+
+## 10. CLI (scheduler surface)
+
+The external scheduler's primary path is the CLI, because schedulers
+understand exit codes and stdout better than HTTP status bodies:
+
+```
+java -jar snow-runner.jar run --source TRS
+java -jar snow-runner.jar run --source ALL --dry-run
+java -jar snow-runner.jar resume --run-id <id>
+java -jar snow-runner.jar status --run-id <id>
+java -jar snow-runner.jar runs --source TRS --status FAILED
+```
+
+- **Exit codes:** `0` = run SUCCEEDED; `1` = run FAILED (step failure,
+  preflight failure, or connection failure — stdout/stderr says
+  which); `2` = usage/configuration error. The scheduler's alerting
+  keys off the exit code; the run id is printed on stdout in all cases
+  so a failed run is still addressable.
+- **Output:** one result line per run (`RUN <id> <status> <steps
+  succeeded>/<steps enabled>`), plus the failed step and its error on
+  failure. Machine-readable output (`--format json`) is a v0.1 feature,
+  not an afterthought — the scheduler parses it.
+- **Spring Shell vs plain args (open question, §13):** a plain
+  `ApplicationRunner` with arguments covers the scheduler. An
+  interactive shell (Spring Shell) adds operator ergonomics for
+  ad-hoc runs but is not needed for v0.1 unless review wants it.
+  Default: plain args; shell later if asked.
+
+## 11. Run history storage
+
+The run and step records need a home that survives application
+restarts and is queryable in SQL. Options:
+
+1. **New control tables in Snowflake (RECOMMENDED).** A dedicated
+   control schema (not a source schema) holding `RUN` and `RUN_STEP`
+   rows. One system of record, visible from the same SQL console as
+   the ETL itself, and consistent with the estate's earlier
+   `JOB_CONTROL_ETL` precedent (which carried a SOURCE column).
+2. **An application-side database** (Postgres, or H2 for local dev).
+   Simpler for the app, but splits the record across two systems and
+   adds a database the deployment must now operate.
+
+**Recommendation: Snowflake control tables.** One explicit caution:
+`MDM_ETL_COMMON` already exists as an *empty placeholder* created for
+future use and explicitly **not** populated — it is a candidate home
+only with an explicit decision, not a default to quietly fill. Wherever
+the tables live, their DDL is versioned in this repo and applied by
+migration (Flyway or Liquibase — to be decided in implementation, not
+in this spec), never by hand.
+
+## 12. Java architecture (Spring Boot + Spring Data JDBC)
+
+Package shape (to be confirmed in implementation, not code yet):
+
+```
+com.example.snowrunner
+  api         REST controllers (thin: translate HTTP ↔ service calls)
+  cli         ApplicationRunner: argument parsing, exit codes, output
+  domain      Run, RunStep, StepDefinition, StepStatus — typed models,
+              a simple fluent API where it helps, no annotations magic
+  service     RunExecutor (the state machine), StepCatalog (loads YAML),
+              SnowflakeCaller (CALLs procedures, captures query ids)
+  repository  Spring Data JDBC repositories + named SQL constants
+              (queries as constants, injected JdbcAggregateTemplate /
+              JdbcTemplate where a repository is the wrong shape)
+  infra       Datasource + Snowflake session configuration, profiles
+```
+
+Rules (the operator's standing code taste, carried into this project):
+
+- **Spring Data JDBC, not JPA.** No `@Entity` graph magic, no lazy
+  loading surprises, no session cache. Aggregates are explicit: a Run
+  owns its steps; repositories load and save aggregates.
+- **Explicit repositories and named SQL constants.** A query lives in
+  one named place. No string-built SQL at call sites, no reflection-
+  based mini-ORM, no dynamic-SQL cleverness.
+- **Injected dependencies, constructor injection.** Nothing static,
+  nothing looked up from a global.
+- **Tests first-class:** unit tests with mocked repositories; slice
+  tests for the REST layer; integration tests against scratch
+  Snowflake (the estate's existing scratch databases, stub data,
+  CREATE-only installs) for the CALL path; a catalog-vs-installed
+  preflight test that fails the build when the catalog names a
+  procedure that does not exist in the reference tree. The IDE story
+  — run one source, one step, from the IDE against scratch — is a
+  requirement, not a nice-to-have, because it is the stated reason for
+  building this in Java.
+
+## 13. Open questions (the discussion agenda)
+
+These are decisions for review, not defaults smuggled into the spec.
+Each needs an answer before implementation of the affected area:
+
+1. **Granularity:** driver-level (recommended, §3) or runner-level?
+2. **Scheduler's primary path:** CLI (recommended, §10) or REST?
+   Or CLI for trigger + REST for monitoring?
+3. **Catalog home:** YAML in repo (recommended, §4) or the
+   `ETL_RUN_CONFIG_TBL` table precedent?
+4. **Run-history home:** Snowflake control tables (recommended, §11)
+   or an application-side database? If Snowflake: is
+   `MDM_ETL_COMMON` the schema, or a new control schema?
+5. **REST auth for v0.1:** API key (minimal) or something stronger
+   from the start?
+6. **Which Snowflake tree does v0.1 target:** the base v3 tree or the
+   TYPE-FIX line? (They are separate lines until adopted; the catalog
+   must name one.)
+7. **Scope guard:** ETL only for v0.1 (recommended), or should the
+   first version also trigger Compare/pipeline runs?
+8. **Interactive shell:** plain CLI args (recommended) or Spring Shell
+   for operator ergonomics?
+9. **Migration tool for control-table DDL:** Flyway or Liquibase?
+10. **Failure policy detail:** fail-fast per workflow is recommended
+    (§6) — is there any source where continue-on-step-failure is
+    actually wanted, and if so, is it a per-workflow setting?
+11. **Scheduler identity:** which external scheduler, and does it call
+    the CLI on a host, or REST over the network? (This decides how
+    much of §9 vs §10 gets built first.)
+
+## 14. Rollout (after spec approval — no code before it)
+
+1. **Spec review** (this document, this session and the next few):
+   answer §13, correct anything wrong about the estate.
+2. **Skeleton:** Spring Boot app that boots, serves `/health`, parses
+   CLI args, and runs `--dry-run` against the catalog — no Snowflake
+   CALLs yet. Proves the shape before the wiring.
+3. **One source end-to-end in scratch:** one workflow (suggested: CRE
+   — single mapping, smallest blast radius) against a scratch schema
+   with stub data, full run record, resume demonstrated.
+4. **All sources in scratch**, catalog-vs-installed preflight test
+   green, CLI exit codes verified by a scheduler dry-run.
+5. **Production read-only rehearsal:** `--dry-run` + preflight
+   against production schemas (no CALLs), then a first live run
+   behind the existing change controls.
+6. **Adoption:** the external scheduler points at the CLI; the old
+   invocation path is retired only after the first successful
+   scheduled runs are on record.
+
+## 15. Glossary
+
+- **Run:** one execution of one workflow (or ALL workflows), with one
+  `P_RUN_TS`, one run id, and a recorded outcome per step.
+- **Workflow:** the ordered steps for one source (e.g. TRS Ongoing).
+- **Step:** one stored-procedure CALL within a workflow.
+- **Mapping driver:** a Snowflake procedure loading one mapping's
+  targets (`sp_snow_main_m_Tgt_C_S_*`).
+- **Workflow runner:** a Snowflake procedure calling a workflow's
+  drivers in order (`sp_etl_run_wf_*`); the catalog mirrors its order.
+- **Resume:** continuing a FAILED/CANCELLED run from its first
+  non-SUCCEEDED step, reusing the original `P_RUN_TS`.
+- **Re-run:** a brand-new run (new id, fresh `P_RUN_TS`) over the same
+  workflow, relying on mapping-level restart semantics.
+- **Preflight:** the read-only verification before the first CALL
+  (procedures exist, schemas reachable, versions recorded).
+- **Catalog:** the versioned, ordered list of steps per workflow (§4).
+
+---
+
+*Next: review §13 in conversation. When the answers land, this spec
+becomes v1.0 and the skeleton (rollout step 2) is the first code —
+nothing before that.*
