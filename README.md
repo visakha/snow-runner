@@ -7,6 +7,9 @@ procedures in sequence, with management control around the calls. It does
 - Invoked by an external scheduler via REST; if health checks
   show the application is not alive, the scheduler launches it
   (java -jar) and then triggers via REST.
+- Access is two-level: the scheduler controls (trigger, resume,
+  cancel); production support reads observability and metrics via
+  endpoints.
 - Spring Boot + Spring Data JDBC (no JPA magic), typed models, explicit
   repositories, named SQL constants.
 - Spec-first: **no application code is written until the spec is

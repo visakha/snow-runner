@@ -26,7 +26,7 @@
 | Touch point | Who / what uses it | What you get |
 |---|---|---|
 | Process launch (scheduler starts the jar) | The external scheduler, only when health checks show the application is not alive | Starts the standalone jar on the Azure VM; the launched application waits for a REST trigger and starts no run by itself |
-| REST API (`/api/v1/runs…`) | The external scheduler (primary trigger) plus operators and dashboards | Start runs, read run and step status, resume, cancel, filter history |
+| REST API (`/api/v1/runs…`) | The external scheduler (control) and production support (read-only) | Scheduler: start runs, resume, cancel. Support: read run and step status, filter history, health, metrics — no control actions. |
 | Actuator health (`/actuator/health`) | Azure health probes, load balancer, on-call | Liveness (is the app up?) separated from readiness (can it reach Snowflake?) — see §2 |
 | Actuator metrics (`/actuator/metrics`, Prometheus exposition) | Azure Monitor | Counters, gauges, and durations the platform scrapes — the raw material for dashboards and alerts |
 | Structured logs (stdout, JSON) | On-call engineers, Log Analytics queries | One event per run/step transition, all carrying the run id — the investigation trail |
@@ -76,6 +76,13 @@ system is healthy.
    There is no self-managed log pipeline, no sidecar agent to
    operate, and no separate observability database to run. That
    is the simplicity decision applied to operations.
+
+8. **Access is role-shaped (decided 2026-10-28).** The
+scheduler holds the control plane; production support holds
+read-only observability via endpoints. An observability
+endpoint must never be a backdoor to a control action: read
+access cannot trigger, resume, or cancel anything, and every
+control call is logged with the caller's identity.
 
 ## 3. Logging
 
@@ -361,6 +368,10 @@ AppTraces
    or agent plus managed-Prometheus scraping of the Actuator
    Prometheus endpoint? Both work; one should be primary to
    avoid double-counting the same metric from two paths.
+7. **Access mechanism detail:** Entra ID app roles
+   (recommended) vs API keys, and which Entra ID group maps to
+   the support (read-only) role. The two-level requirement
+   itself is decided; only the mechanism is open.
 
 ---
 

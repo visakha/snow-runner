@@ -39,6 +39,12 @@
   checks show the application is not alive.
 - **Deployment: Azure VM, standalone jar (decided 2026-10-28).**
   No containers as of now. See 004_OBSERVABILITY.md §6.
+- **Access is two-level (decided 2026-10-28).** The scheduler
+  holds the control plane (trigger, resume, cancel); production
+  support / end users hold read-only access to observability and
+  metrics via endpoints. An observability endpoint must never be
+  a backdoor to a control action. Mechanism detail (Entra ID app
+  roles recommended vs API keys) is still open — see §13 question 5.
 
 ## 1. Purpose
 
@@ -360,6 +366,22 @@ another.
 The scheduler triggers runs here (decided 2026-10-28) — REST is
 the primary path; there is no CLI command interface (§10).
 
+**Access levels (decided 2026-10-28).** Two audiences, two
+levels. The scheduler holds the **control plane**: trigger,
+resume, cancel, and any future control command. Production
+support and other end users hold **read-only observability**:
+run and step status, run history, health, and metrics — via
+endpoints, not via logins to the VM or the database. Rules:
+every endpoint requires an authenticated caller; a control
+endpoint requires the scheduler's identity (or an explicitly
+authorized operator identity); a read endpoint requires any
+authorized identity; an authenticated caller at the wrong level
+gets 403, not a degraded response; and every control call is
+logged with the caller's identity (audit trail — who
+triggered/resumed/cancelled which run, when). The
+authentication mechanism itself (Entra ID app roles recommended,
+API keys as a fallback) is still open — see §13 question 5.
+
 Base: `/api/v1`. All responses carry the run id and the three versions
 from §4.
 
@@ -502,8 +524,11 @@ Each needs an answer before implementation of the affected area:
 4. **Run-history home:** Snowflake control tables (recommended, §11)
    or an application-side database? If Snowflake: is
    `MDM_ETL_COMMON` the schema, or a new control schema?
-5. **REST auth for v0.1:** API key (minimal) or something stronger
-   from the start?
+5. **REST auth for v0.1:** DECIDED IN PRINCIPLE 2026-10-28 — two
+   levels (scheduler = control, support = read-only observability
+   via endpoints). OPEN DETAIL — mechanism: Entra ID app roles
+   (recommended, Azure-native) vs API keys, and which Entra ID
+   group maps to the support role.
 6. **Which Snowflake tree does v0.1 target:** the base v3 tree or the
    TYPE-FIX line? (They are separate lines until adopted; the catalog
    must name one.)
@@ -515,9 +540,15 @@ Each needs an answer before implementation of the affected area:
 10. **Failure policy detail:** fail-fast per workflow is recommended
     (§6) — is there any source where continue-on-step-failure is
     actually wanted, and if so, is it a per-workflow setting?
-11. **Scheduler identity:** which external scheduler, and does it call
-    the CLI on a host, or REST over the network? (This decides how
-    much of §9 vs §10 gets built first.)
+11. **Scheduler identity:** which external scheduler? Path is
+    DECIDED — REST trigger (§9); process launch only for revival
+    (§10). The scheduler's identity is the control-plane identity
+    for the §9 access levels.
+12. **Pause vs cancel:** the scheduler's command vocabulary
+    includes 'pause' in discussion — is pause a distinct command
+    (suspend after the current step, resumable) or does cancel
+    cover stopping a run? Decided at implementation design, not
+    assumed here.
 
 ## 14. Rollout (after spec approval — no code before it)
 
