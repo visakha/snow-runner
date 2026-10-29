@@ -18,4 +18,6 @@ Document numbering: every markdown file generated for this project is
 prefixed with a sequence number in order — `001_`, `002_`, and so on —
 so the set and its order are visible from the filenames alone. Audio
 files follow the same convention: `001_…`, `002_…`, and so on, in the
-same sequence.
+same sequence. Voice notes live in `audio/`, numbered to match their
+document: `001_…` with the spec, `002_…` with the domain model,
+`003_…` with the YAML consumption write-up, and so on.
