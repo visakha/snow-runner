@@ -466,7 +466,8 @@ who flipped what and when) — not a quiet drift back to a table.
   holds the `StepCatalog` interface and its YAML adapter;
   `execution` holds `RunExecutor`, `ResumePolicy`, and preflight;
   `persistence` holds the single `RunRepository` and its named
-  queries; `api` and `cli` stay thin adapters.
+  queries; `api` stays a thin adapter; there is no `cli` adapter (CLI
+  command interface removed 2026-10-28 — process launch only).
 - Nothing else in 001_SPEC changes. In particular, the non-goals,
   the fail-fast rule, the sequential-across-sources default, and the
   Spring Data JDBC constraints all stand exactly as written.

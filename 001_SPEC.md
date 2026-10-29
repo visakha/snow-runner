@@ -31,6 +31,14 @@
   logging, metrics, tracing, health, and alerting per Azure best
   practices for a typical Java application, specified in
   004_OBSERVABILITY.md.
+- **Scheduler trigger: REST (decided 2026-10-28).** The scheduler
+  triggers runs via REST, not CLI.
+- **CLI command interface: REMOVED (decided 2026-10-28).** No
+  run/resume/status commands, no shell. The only CLI involvement
+  is process launch: the scheduler starts the jar when health
+  checks show the application is not alive.
+- **Deployment: Azure VM, standalone jar (decided 2026-10-28).**
+  No containers as of now. See 004_OBSERVABILITY.md §6.
 
 ## 1. Purpose
 
@@ -349,6 +357,9 @@ another.
 
 ## 9. REST API (operations surface)
 
+The scheduler triggers runs here (decided 2026-10-28) — REST is
+the primary path; there is no CLI command interface (§10).
+
 Base: `/api/v1`. All responses carry the run id and the three versions
 from §4.
 
@@ -377,33 +388,46 @@ from §4.
   Snowflake error; the HTTP layer reports run state, it does not hide
   it.
 
-## 10. CLI (scheduler surface)
+## 10. CLI command interface: REMOVED (decided 2026-10-28)
 
-The external scheduler's primary path is the CLI, because schedulers
-understand exit codes and stdout better than HTTP status bodies:
+There is no CLI command interface: no `run`, `resume`, `status`,
+or `runs` commands, and no Spring Shell. The scheduler triggers
+runs via REST (§9) — that decision answers §13 question 2, and it
+makes §13 question 8 (interactive shell) moot.
 
-```
-java -jar snow-runner.jar run --source TRS
-java -jar snow-runner.jar run --source ALL --dry-run
-java -jar snow-runner.jar resume --run-id <id>
-java -jar snow-runner.jar status --run-id <id>
-java -jar snow-runner.jar runs --source TRS --status FAILED
-```
+The word "CLI" survives in exactly one place: **process launch**.
+The application is a standalone jar on an Azure VM (see
+004_OBSERVABILITY.md §6). When the scheduler's health check shows
+the application is not alive, the scheduler launches the process
+(`java -jar snow-runner.jar`) and then triggers via REST once the
+application reports healthy. Launching is starting the process;
+it is not a command interface, it takes no run arguments, and it
+never starts a run by itself — a launched application waits for a
+REST trigger.
 
-- **Exit codes:** `0` = run SUCCEEDED; `1` = run FAILED (step failure,
-  preflight failure, or connection failure — stdout/stderr says
-  which); `2` = usage/configuration error. The scheduler's alerting
-  keys off the exit code; the run id is printed on stdout in all cases
-  so a failed run is still addressable.
-- **Output:** one result line per run (`RUN <id> <status> <steps
-  succeeded>/<steps enabled>`), plus the failed step and its error on
-  failure. Machine-readable output (`--format json`) is a v0.1 feature,
-  not an afterthought — the scheduler parses it.
-- **Spring Shell vs plain args (open question, §13):** a plain
-  `ApplicationRunner` with arguments covers the scheduler. An
-  interactive shell (Spring Shell) adds operator ergonomics for
-  ad-hoc runs but is not needed for v0.1 unless review wants it.
-  Default: plain args; shell later if asked.
+Three rules make this safe:
+
+- **The alive check is liveness, not readiness.** The scheduler
+  checks that the process answers (liveness). If it checked
+  readiness (Snowflake reachable) instead, a Snowflake outage
+  would make the scheduler relaunch a healthy application
+  pointlessly. A Snowflake outage surfaces where it belongs: a
+  run trigger that fails preflight.
+- **One instance, enforced by the port.** If a health check fails
+  transiently while the application is actually alive, a second
+  launch attempt fails to bind the REST port and exits. The port
+  is the singleton guard — no separate lock service, no
+  coordination protocol.
+- **Duplicate triggers are harmless.** If the scheduler retries a
+  trigger after a relaunch, the idempotency key (§9) returns the
+  original run instead of starting a second one. Relaunch plus
+  retry must never become a duplicate publication.
+
+**Startup reconciliation.** On startup, any run left in RUNNING by
+a previous process instance is marked FAILED with the reason
+"application stopped mid-run". Those runs are resumable through
+the normal resume path — the operator decides, with the step
+record intact, rather than the application guessing.
 
 ## 11. Run history storage
 
@@ -471,8 +495,8 @@ These are decisions for review, not defaults smuggled into the spec.
 Each needs an answer before implementation of the affected area:
 
 1. **Granularity:** driver-level (recommended, §3) or runner-level?
-2. **Scheduler's primary path:** CLI (recommended, §10) or REST?
-   Or CLI for trigger + REST for monitoring?
+2. **Scheduler's primary path:** DECIDED 2026-10-28 — REST (§9).
+   §10 (CLI commands) removed.
 3. **Catalog home:** YAML in repo (recommended, §4) or the
    `ETL_RUN_CONFIG_TBL` table precedent?
 4. **Run-history home:** Snowflake control tables (recommended, §11)
@@ -485,8 +509,8 @@ Each needs an answer before implementation of the affected area:
    must name one.)
 7. **Scope guard:** ETL only for v0.1 (recommended), or should the
    first version also trigger Compare/pipeline runs?
-8. **Interactive shell:** plain CLI args (recommended) or Spring Shell
-   for operator ergonomics?
+8. **Interactive shell:** MOOT — no CLI command interface exists
+   (§10). No shell.
 9. **Migration tool for control-table DDL:** Flyway or Liquibase?
 10. **Failure policy detail:** fail-fast per workflow is recommended
     (§6) — is there any source where continue-on-step-failure is

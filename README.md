@@ -4,7 +4,9 @@ Java Spring Boot orchestrator for the Snowflake ETL — it calls the stored
 procedures in sequence, with management control around the calls. It does
 **not** replace any stored procedure and contains **no ETL logic**.
 
-- Invoked by an external scheduler, via CLI and REST.
+- Invoked by an external scheduler via REST; if health checks
+  show the application is not alive, the scheduler launches it
+  (java -jar) and then triggers via REST.
 - Spring Boot + Spring Data JDBC (no JPA magic), typed models, explicit
   repositories, named SQL constants.
 - Spec-first: **no application code is written until the spec is

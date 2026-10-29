@@ -25,8 +25,8 @@
 
 | Touch point | Who / what uses it | What you get |
 |---|---|---|
-| CLI (`run`, `resume`, `status`, `runs`) | The external scheduler; an operator at a terminal | Trigger, resume, and status with exit codes; one result line per run, always carrying the run id |
-| REST API (`/api/v1/runs…`) | Operators, dashboards, and any future automation | Start runs, read run and step status, resume, cancel, filter history |
+| Process launch (scheduler starts the jar) | The external scheduler, only when health checks show the application is not alive | Starts the standalone jar on the Azure VM; the launched application waits for a REST trigger and starts no run by itself |
+| REST API (`/api/v1/runs…`) | The external scheduler (primary trigger) plus operators and dashboards | Start runs, read run and step status, resume, cancel, filter history |
 | Actuator health (`/actuator/health`) | Azure health probes, load balancer, on-call | Liveness (is the app up?) separated from readiness (can it reach Snowflake?) — see §2 |
 | Actuator metrics (`/actuator/metrics`, Prometheus exposition) | Azure Monitor | Counters, gauges, and durations the platform scrapes — the raw material for dashboards and alerts |
 | Structured logs (stdout, JSON) | On-call engineers, Log Analytics queries | One event per run/step transition, all carrying the run id — the investigation trail |
@@ -192,62 +192,82 @@ Rules for metrics, stated plainly:
   When a future version adds one, it inherits the same run id as
   its operation id — it does not invent a new correlation scheme.
 
-## 6. Azure deployment shapes
+## 6. Azure deployment: standalone jar on an Azure VM (decided 2026-10-28)
 
-The application is one artifact (one jar, one container image)
-with two execution shapes. Which Azure service hosts each shape is
-a deployment decision (§8), but the shapes themselves are fixed:
+No containers as of now. The application is a standalone jar on an
+Azure VM. The deployment shape is deliberately boring: one VM, one
+jar, one process, no orchestrator, no image registry, no container
+platform. Container Apps, App Service, and AKS are not rejected
+forever — they are simply not applicable now, and if containers
+come later, this section gets revisited. Nothing else in this
+document changes if that happens: REST, logging, metrics, tracing,
+and alerts are all host-independent.
 
-| Shape | What runs | Scheduler relationship |
-|---|---|---|
-| Service (always on) | REST API + Actuator + run history reads; also accepts REST run triggers | Scheduler calls `POST /runs` |
-| Job (runs to completion) | CLI: one run, then the process exits with the run's exit code | Scheduler triggers a job run (or the scheduler's cron drives it) |
+### The scheduler lifecycle
 
-Candidate hosts, honestly compared:
+The scheduler owns the application's lifecycle, in this loop:
 
-| Host | Service shape | Job shape | Notes |
-|---|---|---|---|
-| **Azure Container Apps (RECOMMENDED)** | Container App (scale to zero off, always on when needed) | Container Apps Job, including cron-scheduled jobs | One image for both shapes; environment + Key Vault references built in; managed identity built in. The job shape is a first-class citizen here, which matters because CLI runs are real work, not an afterthought. |
-| Azure App Service | Web App (jar) | Not a natural fit — jobs need WebJobs or an external trigger calling REST | Fine if the team already standardizes on App Service **and** the scheduler uses REST only. The CLI shape then has no clean home, which is a real cost. |
-| Azure Kubernetes Service | Deployment + CronJob | CronJob / Job | Fully capable, but the heaviest operational footprint for a simple orchestrator. Only if the team already runs AKS and wants this workload there. |
+1. **Health check.** On schedule, the scheduler checks the
+   application's liveness endpoint. Liveness only — process
+   answering, not Snowflake reachable (see the rule below).
+2. **Launch if not alive.** If the check fails (unreachable or
+   unhealthy), the scheduler launches the process on the VM
+   (`java -jar snow-runner.jar`) and waits, bounded, for liveness
+   to become healthy. If liveness never becomes healthy, that is
+   itself an alert (§7) — the revival path failed, and retrying
+   blindly will not fix it.
+3. **Trigger via REST.** Once healthy, the scheduler calls
+   `POST /runs` with an idempotency key and then steps back: the
+   trigger is asynchronous (202 + run id), so the scheduler does
+   not hold a connection open for the run's duration. It may poll
+   run status via REST, or rely on the run-failed alert — either
+   is fine; polling is not required.
+4. **Between runs.** The application stays running after a run
+   ends. It is not stopped after each run and re-launched for the
+   next — launch happens only when health checks show it is not
+   alive. A launched application never starts a run by itself; it
+   waits for a REST trigger.
 
-**Recommendation: Azure Container Apps**, with the external
-scheduler either calling REST on the service or triggering the
-job — whichever the scheduler already does best. The spec does
-not force the scheduler to change shape; it meets it at either
-touch point.
+### Three rules that make this safe
 
-**Configuration and secrets (Azure best practice, all hosts):**
+- **Alive means liveness, not readiness.** If the scheduler
+  checked readiness (Snowflake reachable), a Snowflake outage
+  would make it relaunch a healthy application pointlessly. A
+  Snowflake outage surfaces where it belongs: a run trigger that
+  fails preflight.
+- **One instance, enforced by the port.** If a health check fails
+  transiently while the application is actually alive, a second
+  launch attempt fails to bind the REST port and exits. The port
+  is the singleton guard — no separate lock service.
+- **Duplicate triggers are harmless.** If the scheduler retries a
+  trigger after a relaunch, the idempotency key returns the
+  original run instead of starting a second one.
 
-- Non-secret configuration via environment (App Settings /
-  Container Apps environment variables): Snowflake account,
-  warehouse, role, schema mapping, catalog path.
-- Secrets via **Azure Key Vault**, referenced (never copied) by
-  the application: the Snowflake private key for key-pair auth,
-  and any password/token if a fallback auth path is ever used.
-  The application authenticates to Key Vault with a **managed
-  identity** — no stored credential for the credential store.
-- Nothing secret lives in the repo, in the YAML catalog, in
-  environment files committed to git, or in container image
-  layers. A secret that can be read from the repo is not a
-  secret.
+### Startup reconciliation
 
-**Collection path (Azure best practice):**
+On startup, any run left in RUNNING by a previous process instance
+is marked FAILED with the reason "application stopped mid-run".
+Those runs are resumable through the normal resume path — the
+operator decides, with the step record intact, rather than the
+application guessing. A fresh process never silently adopts or
+restarts another process's in-flight run.
 
-- **Application Insights Java agent** (attached with `-javaagent`,
-  no code changes) for auto-instrumentation: incoming requests,
-  dependencies, exceptions, and Live Metrics. This is the
-  recommended primary path for a Java application on Azure, and
-  it is the same agent story Azure recommends across Java
-  workloads.
-- **Actuator + Micrometer** for application metrics and health,
-  as §4 describes. The agent and Actuator complement each other:
-  the agent sees the process, Actuator sees the application's own
-  numbers.
-- **Log Analytics workspace** as the single store for logs,
-  metrics, and traces. Application Insights data lives in (or is
-  queryable through) that workspace, so one KQL query can span
-  application logs and platform telemetry.
+### Configuration, secrets, and collection on a VM
+
+- Configuration via environment on the VM (account, warehouse,
+  role, schema mapping, catalog path). The catalog file deploys
+  with the jar, so catalog version and application version move
+  together.
+- Secrets via Azure Key Vault, referenced by the application
+  through the VM's system-assigned managed identity — same rule
+  as before, unchanged by the host: nothing secret in the repo,
+  the YAML catalog, or any file committed to git.
+- Collection: the Application Insights Java agent attaches with
+  `-javaagent` as before, and stdout logs are collected into Log
+  Analytics by the Azure Monitor Agent on the VM (a deployment
+  checklist item: the agent and its data collection rule must be
+  in place on the VM, or logs go nowhere — the application
+  cannot detect that from inside itself).
 
 ## 7. Alerts
 
@@ -263,6 +283,7 @@ Each alert names the run id and links to the failure drill-in
 | No successful run in window | No SUCCEEDED run for a source within its expected schedule window | The dead-man switch: a scheduler that stopped firing, or a run that never started, produces no failure — silence is the failure mode this alert exists for |
 | Preflight failure | A run fails preflight | Something changed in Snowflake (a missing procedure) before any work ran |
 | Application unhealthy | Readiness or liveness failing | The service itself is down, not just a run |
+| Application launch failed | Scheduler could not start the application, or liveness never became healthy | The revival path itself failed — needs a human, not another retry |
 | Step duration anomaly | A step's duration far above its historical p95 | A mapping that suddenly takes 3× as long is degrading, even if it still succeeds |
 
 The expected schedule window per source (for the dead-man alert)
@@ -323,12 +344,12 @@ AppTraces
 
 ## 10. Open questions for review
 
-1. **Deployment shape:** Container Apps (recommended) or App
-   Service with REST-only scheduling? The answer decides where
-   the CLI shape lives.
-2. **Scheduler's touch point:** does the external scheduler call
-   REST `POST /runs`, or trigger a CLI job run? Both are
-   supported; one should be primary.
+1. **Deployment shape:** DECIDED 2026-10-28 — Azure VM,
+   standalone jar, no containers.
+2. **Scheduler's touch point:** DECIDED 2026-10-28 — REST
+   `POST /runs` is the trigger; the scheduler launches the jar
+   process only when health checks show the application is not
+   alive.
 3. **Alert recipients and channels:** who gets paged, on what
    channel, for which alerts (§7)? Action Groups need real
    addresses, not placeholders.
