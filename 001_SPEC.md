@@ -17,6 +17,10 @@
   run's timestamp.
 - **Data access: plain Spring Data JDBC only (reaffirmed constraint).**
   No reflection, no invented mini-ORM, no JPA-style magic.
+- **Catalog: YAML-driven, declarative (approved 2026-10-28).** Not
+  Snowflake-table-driven. YAML is easier to work with, versioned,
+  reviewable, and works offline for dry-runs. Decides §13 question 3;
+  detailed in 002_DOMAIN_MODEL.md §6.
 
 ## 1. Purpose
 

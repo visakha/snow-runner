@@ -16,4 +16,6 @@ answers before any implementation begins.
 
 Document numbering: every markdown file generated for this project is
 prefixed with a sequence number in order — `001_`, `002_`, and so on —
-so the set and its order are visible from the filenames alone.
+so the set and its order are visible from the filenames alone. Audio
+files follow the same convention: `001_…`, `002_…`, and so on, in the
+same sequence.
