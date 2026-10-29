@@ -22,7 +22,7 @@ same sequence. Voice notes live in `audio/`, numbered to match their
 document: `001_…` with the spec, `002_…` with the domain model,
 `003_…` with the YAML consumption write-up, and so on.
 
-## Tooling and practices: SivaLabs + harness engineering
+## Tooling and practices: SivaLabs, kept simple
 
 This project uses SivaLabs (Siva Prasad Reddy) tooling to bootstrap
 and guide Spring Boot development:
@@ -42,49 +42,15 @@ and guide Spring Boot development:
   scaffolding, and the data layer is adapted, not taken on JPA
   defaults.
 
-It also adopts the practices from SivaLabs' video
-[Harness Engineering for Java and Spring Boot Applications](https://www.youtube.com/watch?v=H-Xtukxd1ao)
-(37 minutes). The video's central idea, in one sentence: written
-guidelines alone do not bind an AI coding agent — conventions must
-also be encoded as automated checks that fail the build. Applied to
-this project, when implementation starts:
+Decision (2026-10-28): this is a simple project, so the video's
+test harness is NOT adopted — no JaCoCo coverage enforcement, no
+Spring Modulith, no ArchUnit/Taikai rule tests. That would be
+over-engineering here. What is kept from SivaLabs is light: progen
+scaffolding (with the Spring Data JDBC adaptation noted above) and
+Spotless formatting, which ships with the scaffold and costs
+nothing to keep. Agent skills remain guidance only.
 
-- **Formatting:** Spotless with Palantir Java Format (already
-  configured by a progen scaffold). Formatting is applied
-  automatically and verified in the build — an unformatted change
-  fails the build rather than waiting for review.
-- **Coverage:** JaCoCo enforces a minimum coverage threshold that
-  fails the build below it. The threshold itself is set at
-  implementation time and raised over time; coverage is a floor,
-  not a proof of correctness, and tests must cover real behavior
-  rather than chase a percentage.
-- **Module boundaries:** Spring Modulith boundary tests verify the
-  module structure and fail on boundary violations and cycles.
-  Applied here to this project's technical modules (the package
-  areas in `001_SPEC.md` §12: api, cli, execution, catalog,
-  persistence, domain) — not to business dimensions, which live in
-  Snowflake, not in Java. The video's nested business-module layout
-  is a preference, not a mandate: flat or nested is decided at
-  implementation, and the tests then enforce whichever is chosen.
-- **Architecture rules as tests:** ArchUnit, plus Taikai's
-  ready-made rule sets, encode naming, visibility, and dependency
-  direction as build-failing tests — including: repositories not
-  public, controllers package-private and not depending on each
-  other, services not depending on controllers, constructor
-  injection only (no field injection), configuration classes named
-  `*Config`, no generic `Exception` declarations, no deprecated
-  APIs, test classes package-private and never `@Disabled`.
-- **Agent skills as diagnostics only:** the Modulith-verifier style
-  skill check is useful for finding violations, but it does not
-  fail a build — the tests above are the enforcement. Skills guide;
-  tests bind.
-- **Deliberately not adopted:** Checkstyle. For an internal
-  application like this one, Spotless formatting plus the rule
-  tests above cover what matters; Javadoc/comment enforcement is
-  for public libraries, not this project.
-
-These practices constrain how implementation code is written and
-verified. They do not change the spec's decisions (driver-level
-steps, Java-owned run timestamps, YAML catalog, plain Spring Data
-JDBC) — they are the harness that keeps future code, including
-AI-written code, inside those decisions.
+What IS important here is observability, and that is specified in
+004_OBSERVABILITY.md: CLI and REST as the touch points, plus
+Azure-native logging, metrics, tracing, health, and alerting, so
+there is a live view of the application during runtime.

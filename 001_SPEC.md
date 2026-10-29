@@ -21,6 +21,16 @@
   Snowflake-table-driven. YAML is easier to work with, versioned,
   reviewable, and works offline for dry-runs. Decides §13 question 3;
   detailed in 002_DOMAIN_MODEL.md §6.
+- **Simplicity (decided 2026-10-28): no test harness.** No JaCoCo
+  coverage enforcement, no Spring Modulith, no ArchUnit/Taikai rule
+  tests. This is a simple project; that would be over-engineering.
+  Progen scaffolding and Spotless formatting are kept (they ship
+  with the scaffold and cost nothing).
+- **Deployment target: Azure (decided 2026-10-28).** Touch points
+  are CLI and REST, and observability is a first-class requirement:
+  logging, metrics, tracing, health, and alerting per Azure best
+  practices for a typical Java application, specified in
+  004_OBSERVABILITY.md.
 
 ## 1. Purpose
 
