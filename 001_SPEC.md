@@ -7,6 +7,17 @@
 > application only *calls* it, in the right order, with management control
 > around the calls.
 
+## Decisions taken (2026-10-28, recorded from review)
+
+- **Granularity: Option B — driver-level steps, grouped by workflow
+  (approved).** Java calls the mapping drivers directly, in runner
+  order, not the workflow runners.
+- **Run timestamps: Java generates one `P_RUN_TS` per run and passes it
+  explicitly to every step (approved).** Resumes reuse the original
+  run's timestamp.
+- **Data access: plain Spring Data JDBC only (reaffirmed constraint).**
+  No reflection, no invented mini-ORM, no JPA-style magic.
+
 ## 1. Purpose
 
 **snow-runner** is a Java Spring Boot application that runs the Snowflake
