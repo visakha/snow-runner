@@ -45,6 +45,14 @@
   metrics via endpoints. An observability endpoint must never be
   a backdoor to a control action. Mechanism detail (Entra ID app
   roles recommended vs API keys) is still open — see §13 question 5.
+- **Run lifecycle and control tables (decided 2026-10-28, see
+  005_RUN_LIFECYCLE_AND_CONTROL_TABLES.md).** Run/step state
+  machines, RUN + RUN_STEP tables in a new database
+  MDM_ETL_RUNNER, schema CONTROL; resume = new attempt on the
+  same run id and timestamp; pause distinct from cancel (pause
+  suspends and is resumable, cancel is terminal); dry-run leaves
+  no RUN row; Flyway for control-table migrations; one active
+  run per workflow.
 
 ## 1. Purpose
 
@@ -521,9 +529,10 @@ Each needs an answer before implementation of the affected area:
    §10 (CLI commands) removed.
 3. **Catalog home:** YAML in repo (recommended, §4) or the
    `ETL_RUN_CONFIG_TBL` table precedent?
-4. **Run-history home:** Snowflake control tables (recommended, §11)
-   or an application-side database? If Snowflake: is
-   `MDM_ETL_COMMON` the schema, or a new control schema?
+4. **Run-history home:** DECIDED 2026-10-28 (see 005) —
+   Snowflake control tables in a new database MDM_ETL_RUNNER,
+   schema CONTROL (not MDM_ETL_COMMON). Database name needs
+   the user's confirmation (005 §11 question 1).
 5. **REST auth for v0.1:** DECIDED IN PRINCIPLE 2026-10-28 — two
    levels (scheduler = control, support = read-only observability
    via endpoints). OPEN DETAIL — mechanism: Entra ID app roles
@@ -536,7 +545,8 @@ Each needs an answer before implementation of the affected area:
    first version also trigger Compare/pipeline runs?
 8. **Interactive shell:** MOOT — no CLI command interface exists
    (§10). No shell.
-9. **Migration tool for control-table DDL:** Flyway or Liquibase?
+9. **Migration tool for control-table DDL:** DECIDED 2026-10-28
+   (see 005 §7) — Flyway, versioned SQL scripts.
 10. **Failure policy detail:** fail-fast per workflow is recommended
     (§6) — is there any source where continue-on-step-failure is
     actually wanted, and if so, is it a per-workflow setting?
@@ -544,11 +554,9 @@ Each needs an answer before implementation of the affected area:
     DECIDED — REST trigger (§9); process launch only for revival
     (§10). The scheduler's identity is the control-plane identity
     for the §9 access levels.
-12. **Pause vs cancel:** the scheduler's command vocabulary
-    includes 'pause' in discussion — is pause a distinct command
-    (suspend after the current step, resumable) or does cancel
-    cover stopping a run? Decided at implementation design, not
-    assumed here.
+12. **Pause vs cancel:** DECIDED 2026-10-28 (see 005 §4) —
+    pause is distinct (suspend after the current step,
+    resumable); cancel is terminal.
 
 ## 14. Rollout (after spec approval — no code before it)
 

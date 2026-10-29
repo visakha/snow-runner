@@ -1,0 +1,435 @@
+# 005 — Run lifecycle and control tables
+
+> Companion to [001_SPEC.md](001_SPEC.md) (the orchestrator spec),
+> [002_DOMAIN_MODEL.md](002_DOMAIN_MODEL.md) (modeling),
+> [003_YAML_CONSUMPTION.md](003_YAML_CONSUMPTION.md) (catalog
+> execution), and [004_OBSERVABILITY.md](004_OBSERVABILITY.md)
+> (touch points and Azure observability). Still spec, still no
+> code.
+>
+> Decisions recorded here (2026-10-28):
+>
+> - **Run and step state machines** (§1): five run states, five
+>   step states, with the transition rules stated exactly.
+> - **Control tables** (§2): `RUN` and `RUN_STEP` in Snowflake,
+>   one row per step per attempt, plus a `RUN_STEP_CURRENT` view.
+> - **Attempts** (§3): resume is a new attempt on the same run
+>   id, reusing the original `P_RUN_TS`, executing only
+>   non-SUCCEEDED, non-disabled steps.
+> - **Pause is distinct from cancel** (§4): pause suspends after
+>   the current step and is resumable; cancel ends the run and
+>   is terminal.
+> - **Fail-fast with named skip reasons** (§5): a failed step
+>   skips the rest, and every skipped step says why.
+> - **Startup reconciliation** (§6): a run left RUNNING by a dead
+>   process is marked FAILED, resumable, never silently adopted.
+> - **Home** (§7): a new database `MDM_ETL_RUNNER`, schema
+>   `CONTROL` — not `MDM_ETL_COMMON`, for the reasons in §7.
+> - **Migration tool** (§7): Flyway, versioned SQL scripts.
+> - **Dry-run leaves no RUN row** (§8): a dry-run is a rehearsal,
+>   not a run, and must not pollute history or metrics.
+> - **One active run per workflow** (§9): a second trigger while
+>   a run is RUNNING or PAUSED is rejected, not queued.
+
+## 1. The state machines
+
+There are two state machines, not one: the run's and the step's.
+A run's status is never computed by counting steps on the fly in
+application code — it is a stored value on the RUN row, updated
+at the transitions below, and the step rows are the evidence
+behind it.
+
+### Run states
+
+| State | Meaning |
+|---|---|
+| RUNNING | Execution is in progress (or the run was created and the executor has started). There is no QUEUED state in v0.1 — there is no queue; a trigger starts execution. QUEUED is reserved for a future version that queues work. |
+| SUCCEEDED | Every step SUCCEEDED or SKIPPED-disabled (a workflow with disabled steps still succeeds when all its live steps succeed). |
+| FAILED | A step FAILED under fail-fast (§5), or a previous process instance died mid-run (§6). Resumable. |
+| PAUSED | Pause was requested; the in-flight step completed, the rest stayed PENDING. Resumable. |
+| CANCELLED | Cancel was requested; the run was abandoned. Terminal — not resumable (§4). |
+
+### Step states
+
+| State | Meaning |
+|---|---|
+| PENDING | Created, not yet executed. |
+| RUNNING | Its CALL is in flight. |
+| SUCCEEDED | Its CALL completed and its summary was captured. |
+| FAILED | Its CALL failed; the verbatim error is on the row. |
+| SKIPPED | It will not execute in this attempt, for a stated reason (§5). |
+
+### Run transitions (the complete list)
+
+| From | To | Trigger |
+|---|---|---|
+| — (trigger) | RUNNING | Scheduler (or authorized operator) triggers a workflow |
+| RUNNING | SUCCEEDED | All steps reached SUCCEEDED or SKIPPED-disabled |
+| RUNNING | FAILED | A step FAILED (fail-fast), or startup reconciliation (§6) |
+| RUNNING | PAUSED | Pause requested (§4) |
+| RUNNING | CANCELLED | Cancel requested (§4) |
+| PAUSED | RUNNING | Resume |
+| PAUSED | CANCELLED | Cancel |
+| FAILED | RUNNING | Resume (new attempt, §3) |
+
+Everything else is rejected: resume on SUCCEEDED or CANCELLED,
+pause on FAILED or any terminal state, cancel on SUCCEEDED,
+FAILED, or CANCELLED, and any transition on a run that is
+already in the target state except pause-on-PAUSED, which is a
+no-op returning the current state. Rejections are HTTP 409 with
+the run's current state in the response — the caller learns
+*what* is true, not just that the request failed.
+
+### Step transitions (the complete list)
+
+- PENDING → RUNNING → SUCCEEDED, or PENDING → RUNNING → FAILED.
+- PENDING → SKIPPED, with a reason (§5): DISABLED (at run
+  creation), FAIL_FAST (a prior step failed), CANCELLED (the run
+  was cancelled), APP_STOPPED (startup reconciliation, §6).
+- RUNNING → FAILED, only via startup reconciliation (§6).
+
+A step never returns to PENDING within an attempt. A later
+attempt creates new rows for the steps it executes (§3); it does
+not rewrite the earlier attempt's rows.
+
+## 2. The control tables
+
+Both tables live in Snowflake (§7). Types are Snowflake types.
+Keys are declared on the tables; Snowflake treats declared keys
+as informational, so the real enforcement is the single writer —
+only the application writes these tables, and only one instance
+of the application runs (§9, plus the port guard in 004 §6).
+
+### `CONTROL.RUN` — one row per run
+
+| Column | Type | Meaning |
+|---|---|---|
+| RUN_ID | VARCHAR | UUID generated by Java. The run's identity and its correlation id (logs, traces, query tags). Primary key. |
+| WORKFLOW_ID | VARCHAR | E.g. TRS_ONGOING. |
+| SOURCE | VARCHAR | TRS / ECI / FSS / WIC / TTF / CRE. |
+| STATUS | VARCHAR | One of the five run states (§1). |
+| RUN_TS | TIMESTAMP_NTZ | The Java-owned `P_RUN_TS`: one per run, reused on resume. |
+| CATALOG_VERSION | VARCHAR | Catalog version from 001 §4. |
+| APP_VERSION | VARCHAR | Application version from 001 §4. |
+| SNOWFLAKE_TREE_VERSION | VARCHAR | Snowflake tree version from 001 §4. |
+| TRIGGERED_BY | VARCHAR | Caller identity (scheduler identity or operator) — audit. |
+| IDEMPOTENCY_KEY | VARCHAR | The trigger's idempotency key. The application looks a trigger up by this key before inserting, so a retried trigger returns the existing run instead of a duplicate. |
+| CURRENT_ATTEMPT_NO | NUMBER | Starts at 1, increments on every resume. |
+| CREATED_AT | TIMESTAMP_NTZ | When the trigger was accepted. |
+| UPDATED_AT | TIMESTAMP_NTZ | Last transition. |
+| ENDED_AT | TIMESTAMP_NTZ | Null until the run reaches SUCCEEDED, FAILED, or CANCELLED. (A PAUSED run has no ENDED_AT — it is not over.) |
+| STEPS_SUCCEEDED / STEPS_FAILED / STEPS_SKIPPED | NUMBER | Final counts, written when the run ends. During a run, counts are computed from RUN_STEP, not read from here. |
+| ERROR_MESSAGE | VARCHAR | The first failure's verbatim error. Null unless the run FAILED. |
+
+### `CONTROL.RUN_STEP` — one row per step per attempt
+
+| Column | Type | Meaning |
+|---|---|---|
+| RUN_ID | VARCHAR | Part of the key. |
+| STEP_ID | VARCHAR | Part of the key. E.g. TRS_PTY_ONGOING. |
+| ATTEMPT_NO | NUMBER | Part of the key. Which attempt this row belongs to. |
+| STEP_POSITION | NUMBER | Catalog position, for ordering in displays. |
+| PROCEDURE_NAME | VARCHAR | Fully qualified procedure name as resolved from the catalog (schema + procedure). |
+| STATUS | VARCHAR | One of the five step states (§1). |
+| QUERY_ID | VARCHAR | Snowflake query id, on SUCCEEDED and FAILED rows. Null otherwise. |
+| STARTED_AT / ENDED_AT | TIMESTAMP_NTZ | Null until the step starts / ends. |
+| DURATION_MS | NUMBER | Null until the step ends. |
+| ERROR_MESSAGE | VARCHAR | Verbatim Snowflake error, on FAILED rows. |
+| SKIPPED_REASON | VARCHAR | Null unless SKIPPED: DISABLED, FAIL_FAST, CANCELLED, or APP_STOPPED. |
+
+Key: (RUN_ID, STEP_ID, ATTEMPT_NO).
+
+At run creation, a RUN_STEP row is created for **every** catalog
+step in the workflow — including disabled steps, marked SKIPPED
+with reason DISABLED. That makes step counts stable and the
+history complete: a support engineer reading a run sees what was
+disabled, not just what ran. The alternative (rows only for
+executed steps) was rejected because it makes "why didn't this
+step run?" unanswerable from the history.
+
+### `CONTROL.RUN_STEP_CURRENT` — view, not a table
+
+One row per (RUN_ID, STEP_ID): the highest-ATTEMPT_NO row. This
+works as the "current status" definition because of one rule
+from §3: a step that SUCCEEDED in an earlier attempt gets no new
+row in a later attempt, so its latest row *is* its SUCCEEDED
+row; a step that failed gets a new row in the next attempt, so
+its latest row is the newest outcome. Read endpoints (§10) and
+the resume computation (§3) both read this view, never raw
+RUN_STEP, when they mean "current".
+
+## 3. Attempts and the resume rule
+
+Resume is a new attempt on the same run id — never a new run,
+never a new timestamp. Concretely, resuming a FAILED or PAUSED
+run:
+
+1. `CURRENT_ATTEMPT_NO` increments by one on the RUN row; the
+   run returns to RUNNING.
+2. The executor reads `RUN_STEP_CURRENT` and executes **every
+   step whose current status is not SUCCEEDED and not
+   SKIPPED-disabled**. That is the whole rule. It covers:
+   PENDING steps (never ran, e.g. after a pause), FAILED steps
+   (re-run), and SKIPPED-FAIL_FAST / SKIPPED-APP_STOPPED steps
+   (never ran — the skip was circumstantial, not a decision).
+3. Each executed step writes a new RUN_STEP row under the new
+   attempt number, with its own query id, duration, and outcome.
+4. `RUN_TS` is unchanged — the resumed attempt passes the
+   original timestamp to every step, exactly as 001 §5 requires.
+   (This is why resume is safe for the run filters: the resumed
+   steps match the same run window as the original attempt.)
+
+A resumed run that then fails again is resumable again, under
+the same rule, with a further attempt number. There is no cap on
+attempts in v0.1 — a cap would be an operator policy, not a
+correctness rule, and inventing one now would only create a
+second way for a run to get stuck.
+
+One honest caveat, in the crash window: if the application dies
+after a step's CALL commits in Snowflake but before the step row
+is persisted, reconciliation (§6) marks that step FAILED, and a
+resume re-executes it. For most steps that is harmless
+(insert-only with guards); for a DQM step it can append a
+second DQM row, because DQM passes append on every execution.
+This is the same known DQM-append limitation the estate already
+accepts, narrowed to one window — and it is diagnosable, because
+the committed CALL is findable in Snowflake's query history by
+the run's query tag even though the step row has no query id.
+No automatic dedup is built in v0.1; the operator sees the
+attempt history and judges.
+
+## 4. Pause is distinct from cancel
+
+The scheduler's vocabulary includes both words, and they are not
+the same command. Decided here:
+
+**Pause** — "stop after the current step, and let me continue
+later." The executor checks a pause flag between steps only;
+the in-flight CALL is never interrupted. When the current step
+completes, its outcome is recorded, the remaining steps stay
+PENDING, and the run becomes PAUSED. Resume continues it (§3).
+Pause on a PAUSED run is a no-op. Pause on a terminal or FAILED
+run is rejected (a FAILED run resumes; it does not pause).
+
+**Cancel** — "abandon this run." The executor checks a cancel
+flag between steps only; the in-flight CALL completes and its
+outcome is recorded, then every remaining PENDING step becomes
+SKIPPED with reason CANCELLED, and the run becomes CANCELLED.
+Cancel on a PAUSED run works the same way (its PENDING steps
+become SKIPPED-CANCELLED). CANCELLED is terminal: resume on a
+CANCELLED run is rejected. The way to redo abandoned work is a
+fresh trigger — a new run id, a new timestamp, a clean history —
+not a resurrection of the abandoned run.
+
+**Why neither kills the in-flight CALL:** killing a Snowflake
+query mid-flight from Java is possible, but a loader killed
+mid-CALL leaves partial writes that are harder to reason about
+than a completed step, and the estate's loaders are insert-only
+with guards — a completed step is always a known state, a
+killed step is not. Cooperative stop-between-steps is the
+simpler, safer contract, and it is fast enough: the longest
+observed loader is ~15 minutes, so the worst case for a stop
+request is waiting out one step. If a runaway-query problem ever
+appears in practice, query cancellation is a future addition,
+not a v0.1 feature.
+
+## 5. Fail-fast and the skip reasons
+
+Fail-fast (001 §6) is implemented through the skip reasons, not
+through a separate mechanism: when a step FAILS, the executor
+stops issuing CALLs, marks every still-PENDING step SKIPPED with
+reason FAIL_FAST, and marks the run FAILED with the step's
+verbatim error. The support engineer reading that run sees
+exactly one FAILED step and a row of FAIL_FAST skips — the
+failure point is unambiguous.
+
+The complete skip-reason vocabulary, closed in v0.1:
+
+| Reason | When |
+|---|---|
+| DISABLED | Step disabled in the catalog at run creation. Never re-executed on resume. |
+| FAIL_FAST | A prior step failed in this attempt. Re-executed on resume (it never ran). |
+| CANCELLED | The run was cancelled. The run is terminal, so this reason never resumes. |
+| APP_STOPPED | Startup reconciliation (§6). Re-executed on resume (it never ran, or its outcome was never recorded). |
+
+No other reason strings are invented at runtime. A new reason
+requires a spec change, because a reason the support team has
+never seen is a reason they cannot triage. (This is the same
+discipline as 002's rule that Java never branches on flag-reason
+strings — here the vocabulary is small, closed, and owned by
+the spec, not by Snowflake data.)
+
+Per-workflow continue-on-step-failure (001 §13 question 10)
+stays open: if a workflow ever wants it, the schema does not
+change — the executor would simply not apply FAIL_FAST for that
+workflow, and the skip reasons would still describe what
+happened. The state machine already accommodates it.
+
+## 6. Startup reconciliation
+
+On startup, before accepting triggers, the application
+reconciles runs left by a previous process instance:
+
+- Any RUN row in RUNNING becomes FAILED, with ERROR_MESSAGE
+  "application stopped mid-run".
+- Any RUN_STEP row in RUNNING under such a run becomes FAILED
+  with the same reason.
+- Any PENDING step under such a run becomes SKIPPED with reason
+  APP_STOPPED.
+
+After reconciliation, every run in the tables is in a state the
+current process understands, and the reconciled runs are
+resumable under §3. A fresh process never silently adopts or
+restarts another process's in-flight run, and it never deletes
+the evidence that the previous process died. (This is the same
+rule recorded in 001 §10 and 004 §6, stated here with its step
+effects.)
+
+Readiness reflects this: the application is not ready to accept
+triggers until reconciliation has completed. Liveness is
+unaffected — the process is up while it reconciles.
+
+## 7. Home and migration tool
+
+### Home: new database `MDM_ETL_RUNNER`, schema `CONTROL`
+
+The control tables live in Snowflake, in a dedicated database
+`MDM_ETL_RUNNER`, schema `CONTROL`: `MDM_ETL_RUNNER.CONTROL.RUN`,
+`MDM_ETL_RUNNER.CONTROL.RUN_STEP`, and the view
+`MDM_ETL_RUNNER.CONTROL.RUN_STEP_CURRENT`.
+
+Why not `MDM_ETL_COMMON`, the empty placeholder database? Four
+reasons, in order of weight:
+
+1. **Ownership.** Run history is snow-runner's own operational
+   state, written by exactly one writer (the application) and
+   read by the application and the support team. COMMON's
+   stated purpose is shared ETL code. Putting app state in a
+   shared-code database blurs who owns what, and the first time
+   another tool claims COMMON for its own purpose, the two
+   tenants collide.
+2. **Separation of lifecycle.** Retention and cleanup for run
+   history (§11) is an application policy; it should not be
+   negotiated against whatever COMMON later holds.
+3. **Cross-source by construction.** Run history spans all six
+   sources, so it cannot live in a source schema
+   (`TRS_ETL_WRK` and friends) — a dedicated home is required
+   regardless; the only question was which dedicated home, and
+   a runner-owned one is the honest answer.
+4. **The placeholder stays a placeholder.** COMMON was created
+   empty for future use, explicitly not populated. Filling it
+   now, quietly, with the first thing that needed a home would
+   be exactly the quiet-fill the project decided against.
+
+Why not an application-side database (the 001 §11
+alternative)? Because run history must survive the application
+process — the whole point of reconciliation (§6) is that a new
+process instance reads what the dead one wrote — and because
+the support team's reads and the Snowflake-side joins (query
+tags, §10) both assume Snowflake. An application-side database
+would be a second store to operate, back up, and keep
+consistent with Snowflake, for no benefit in v0.1.
+
+The database name itself needs the user's confirmation, since
+creating a new database is a real act, not a naming preference
+— it is recorded as an open question (§11) even though this
+document recommends it.
+
+### Migration tool: Flyway
+
+Control-table DDL is managed by **Flyway**, as versioned SQL
+migration scripts (e.g. `V1__create_control_tables.sql`),
+applied by the application at startup before it accepts
+triggers. Flyway is chosen over Liquibase for one reason that
+matches this project's taste throughout: migrations are plain
+SQL, named and reviewable, with no XML/YAML changelog
+abstraction between the author and the statement that runs.
+Liquibase's abstraction would be a second language to learn for
+a schema of two tables and one view.
+
+## 8. Dry-run leaves no RUN row
+
+A dry-run (001 §7, 003 §9) does not create a RUN row, does not
+consume an idempotency key, and does not appear in run history,
+dead-man metrics, or support views. It returns the ordered step
+list with resolved procedure names in the response, and logs a
+`DRY_RUN_LISTED` event with an ephemeral dry-run id that is
+explicitly not a run id. Rationale: history must mean "work was
+attempted". A rehearsal recorded as a run would corrupt the
+dead-man signal (a dry-run is not a success), inflate run
+counts, and confuse the support engineer asking "did last
+night's run happen?" If dry-run audit is ever wanted, it is a
+separate record type, not a RUN row — not assumed here.
+
+## 9. One active run per workflow
+
+At most one RUNNING or PAUSED run per workflow. A trigger for a
+workflow that already has a RUNNING or PAUSED run is rejected
+with 409 and the active run's id in the response. The operator
+resumes or cancels the active run first. FAILED, SUCCEEDED, and
+CANCELLED runs do not block a new trigger — a FAILED run's
+operator may choose a fresh trigger over a resume, abandoning
+the failed run implicitly (its history remains, resumable in
+principle, but a newer run for the same workflow now exists;
+resuming the older run afterwards is allowed by the rules but
+discouraged, and the DQM caution in §3 applies with full force
+to that sequence).
+
+This guard is enforced by the application (a RUNNING/PAUSED
+lookup before insert), not by a database constraint — the
+single-writer, single-instance shape makes the check reliable,
+and a constraint would only add a second, divergent source of
+truth.
+
+## 10. What the read endpoints see (shape, not contract)
+
+The full endpoint contract is the next document (006). What this
+document fixes is the data behind it, so the contract does not
+have to re-decide it:
+
+- Run lists and run detail read `CONTROL.RUN` plus
+  `CONTROL.RUN_STEP_CURRENT` — current status per step, with
+  final counts on the RUN row once ended.
+- Attempt history reads `CONTROL.RUN_STEP` directly, ordered by
+  attempt, so a support engineer can see that a step failed in
+  attempt 1 and succeeded in attempt 2.
+- The support (read-only) role can call all of these; the
+  scheduler (control) role can call these plus trigger, resume,
+  pause, and cancel (004's two-level rule, 001 §9).
+
+## 11. Open questions for review
+
+1. **Database name confirmation:** `MDM_ETL_RUNNER` as the new
+   database (§7) — recommended here, but creating a database
+   needs the user's yes.
+2. **Retention policy:** how long are RUN and RUN_STEP rows
+   kept? Suggested alignment with the log retention decision
+   (004 §10), but run history has its own value as audit — the
+   two retentions need not match, and the operator decides.
+3. **Per-workflow continue-on-step-failure** (carried from 001
+   §13 question 10): still open; the schema already
+   accommodates it (§5).
+4. **CANCELLED terminal — confirm on review:** cancel-as-terminal
+   is decided here (§4); if the team wants cancelled runs
+   resumable, that is a one-rule change, but it must be a
+   conscious one, because it reopens the "what does cancel
+   mean?" question for the support team.
+
+## 12. What this closes
+
+- 001 §13 question 4 (run-history home): Snowflake control
+  tables, in `MDM_ETL_RUNNER.CONTROL`.
+- 001 §13 question 9 (migration tool): Flyway.
+- 001 §13 question 12 (pause vs cancel): distinct, §4.
+- 003 §9 open item 3 (dry-run record): no RUN row, §8.
+- 001 §10 / 004 §6 startup reconciliation: stated with step
+  effects, §6.
+
+Carried forward, not closed: 001 §13 question 10
+(continue-on-failure), 004 §10 retention (now joined by
+run-history retention, §11 question 2), and the 004 §10 access
+mechanism detail.
+
+---
+
+*Next in sequence: `006_…` — the API contract.*
