@@ -12,6 +12,9 @@ procedures in sequence, with management control around the calls. It does
   endpoints.
 - Spring Boot + Spring Data JDBC (no JPA magic), typed models, explicit
   repositories, named SQL constants.
+- Coding guidelines: [CODING_GUIDELINES.md](CODING_GUIDELINES.md) —
+  necessary-only code, Google Java Style enforced in the Maven
+  build, and the package arrangement kept in sync with the code.
 - Spec-first: **no application code is written until the spec is
   approved.**
 
