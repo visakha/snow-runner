@@ -1,0 +1,514 @@
+# =====================================================================
+# steps-catalog.yml — REVIEW SKETCH ONLY (v2, phases incorporated)
+# =====================================================================
+# Status: a sketch for review. NOT spec, NOT committed to the repo,
+# NOT executable as-is. It supersedes the earlier v1 sketch (which
+# was never committed either, so nothing needs unwinding).
+#
+# How to read this file:
+# - Steps are the 40 real driver procedures, in runner order.
+#   Every procedure name below was read from the 7 runner files
+#   (sp_etl_run_wf_*.sql) in the v3 tree — none is invented.
+# - Each step carries `phases:` — the flow phases that driver
+#   executes INTERNALLY. This is the load-bearing fact, verified
+#   by grepping all 40 driver files for sp_common_* calls:
+#   enrich / exc / dqm / valexc procedures run INSIDE driver
+#   CALLs; they are not separate CALLs the Java side makes.
+#   So the phase classes in the package sketch are the Java-side
+#   owners/handles for a phase's work within a driver step —
+#   they do NOT each issue their own CALL. If you instead want
+#   Java to call loaders and passes directly, that moves
+#   driver-internal orchestration into Java and is a bigger
+#   change — say so and the YAML becomes phase-level steps.
+# - Phase vocabulary (closed in this sketch):
+#     loader  = spine landing: the driver lands rows on C_S_*
+#               with spine flags + reasons, and drops/recreates
+#               its temporary work tables at mapping start.
+#               No records are deleted by this phase.
+#     enrich  = non-spine enrichment: UPDATEs C_S_* in place
+#               (standardisation via lookups, e.g. phone type).
+#     exc     = exception passes: C_S_* -> EXC_STG_BAD_REC_MEMB,
+#               one row per failed check, idempotent by the
+#               NOT EXISTS guard.
+#     dqm     = AddressDoctor pass: C_S_* -> DQM_ADDRESS.
+#               APPENDS on every execution — see rerunSafety.
+#     valexc  = staging exception pass (sp_common_pass_val_exc).
+#               Reads STAGING, not C_S_*. Runs inside the
+#               *Pty_Validation drivers only (ECI/FSS/WIC/TTF) —
+#               which is why it runs first: those drivers run
+#               first in their runners. TRS and CRE have no
+#               Validation driver and therefore no valexc phase.
+# - Stage mapping: spine stage = loader phase; non-spine stage =
+#   enrich + exc + dqm phases. The package sketch mirrors this:
+#   <source>/loader/ is the spine stage; <source>/enrich/,
+#   <source>/exc/, <source>/dqm/ are the non-spine stage.
+# - Lifecycle operations are NOT steps and have no procedure:
+#   preflight = existence checks, READ-ONLY (temp-table drops
+#   live inside loaders at mapping start, not in preflight);
+#   flush     = making C_S_* ready for downstream MDM consumption
+#               by looking at flags — NO flush procedure exists
+#               in the estate today (the MDM batch reads
+#               V_MDM_*); a Java flush writing C_S_* would be new
+#               ETL logic, flagged here, not invented;
+#   postflight = closing tasks (final counts, run marked ended).
+#   They live in <source>/preflight, /flush, /postflight
+#   packages as Java-side classes, not catalog steps.
+# - Handler binding: the YAML does NOT name Java classes.
+#   Step -> phase-class binding is done by a code registry
+#   (step id -> handler bean, constructor injection). Naming a
+#   class in YAML would need reflection to instantiate, which
+#   this project forbids. The registry is the one place that
+#   knows which class owns which phase of which step.
+# - rerunSafety: APPEND only on the 4 drivers that call
+#   sp_common_pass_adr_dqm (re-running them re-appends DQM
+#   rows). Every other driver is SAFE here because the grep
+#   proves it fires no DQM pass; EXC is guard-idempotent and
+#   enrich UPDATEs in place. (This replaces the old standing
+#   caveat that SAFE labels needed per-driver verification —
+#   that verification is exactly this grep.)
+# - Schemas (snowflake side): TRS_ETL_WRK is the verified TRS
+#   schema; the others follow the same <SOURCE>_ETL_WRK
+#   convention and must be confirmed per source at
+#   implementation time. The oracle side is all dummy
+#   placeholders — see Database swap.
+# - One class per (source, phase, dimension), NOT per procedure:
+#   e.g. TrsPartyExc covers all PTY exc passes of TRS. A class
+#   per procedure would be ~29 exc classes for TRS alone.
+# - Database swap (added 2026-10-30): the whole catalog runs
+#   against ONE database, chosen by the single flag
+#   `targetDatabase` below. Allowed values: snowflake, oracle.
+#   Anything else fails fast at startup, like any other invalid
+#   catalog value. Switching databases means editing the flag
+#   and restarting — the catalog is immutable at startup, and
+#   a run never changes database halfway through.
+#   Java side of the flag: ProcedureCaller gets one
+#   implementation per database (SnowflakeProcedureCaller, and
+#   an OracleProcedureCaller to be written); the flag picks the
+#   implementation once at startup, not per step. Preflight
+#   existence checks run against the selected database only,
+#   and a run records the flag value (when this lands in spec,
+#   the RUN table gains a target_database column).
+#   Dummy convention — every Oracle value in this file is a
+#   placeholder by design, and it says so in the value itself:
+#     oracleProcedure: DUMMY_ORA_<STEP_ID>
+#     oracle schema:   DUMMY_ORA_<SOURCE>_WRK
+#     oracle host:     DUMMY_HOST.invalid (never a real host)
+#   Reason: no Oracle procedures exist in this estate today —
+#   the IDQ side is Informatica mappings, not Oracle stored
+#   procedures — so every Oracle procedure name here is a
+#   dummy shape waiting for a real name. Running with
+#   targetDatabase: oracle before replacing them fails
+#   preflight (procedure does not exist). That fail-closed
+#   outcome is intended, not a bug.
+#   Parameters are assumed the same on both sides (P_RUN_TS,
+#   P_SOURCE). If Oracle procedures take different parameters,
+#   defaults gains a per-database parameters block then; it is
+#   not invented now.
+#   Secrets NEVER go in this file: no passwords, no keys, no
+#   real account identifiers. Connection values below are
+#   placeholders; real ones come from environment / vault at
+#   runtime.
+
+catalogVersion: 0.1-sketch
+
+# THE FLAG: which database this whole catalog runs against.
+# snowflake = today's real target; oracle = placeholder side,
+# usable only after every DUMMY_ORA_ value is replaced.
+targetDatabase: snowflake
+
+# One schema per source, per database. Common procedures are
+# installed into each source schema from the same files
+# (edit-once, DevOps repeats the install) — Java never
+# qualifies a common procedure with a foreign schema.
+schemas:
+  snowflake:
+    TRS: TRS_ETL_WRK
+    ECI: ECI_ETL_WRK
+    FSS: FSS_ETL_WRK
+    WIC: WIC_ETL_WRK
+    TTF: TTF_ETL_WRK
+    CRE: CRE_ETL_WRK
+  oracle:
+    # ALL DUMMY — replace with the real Oracle schema per
+    # source before any run with targetDatabase: oracle.
+    TRS: TRS_ETL_WRK
+    ECI: ECI_ETL_WRK
+    FSS: FSS_ETL_WRK
+    WIC: WIC_ETL_WRK
+    TTF: TTF_ETL_WRK
+    CRE: CRE_ETL_WRK
+
+# Connection placeholders only — structural, non-secret values
+# that let the file parse and the flag select a caller. Real
+# hosts, accounts, users, and secrets come from environment /
+# vault at runtime and are never written here.
+databases:
+  snowflake:
+    driverClass: net.snowflake.client.jdbc.SnowflakeDriver
+    urlTemplate: jdbc:snowflake://DUMMY_ACCOUNT.snowflakecomputing.com
+    warehouse: DUMMY_WAREHOUSE
+    role: DUMMY_ROLE
+    auth: key-pair
+  oracle:
+    driverClass: oracle.jdbc.OracleDriver
+    urlTemplate: jdbc:oracle:thin:@DUMMY_HOST.invalid:1521/DUMMY_SERVICE
+    auth: username-password
+
+# Defaults applied to every step unless the step overrides them.
+defaults:
+  timeoutMinutes: 30
+  # No parameters: driver steps are called with zero arguments.
+  # Drivers take only source-specific code parameters (all
+  # defaulted) and generate their own run timestamp internally.
+  # See CROSS_CHECK_REPORT.md finding 1.
+
+workflows:
+  # ----------------------------------------------------------------
+  # TRS Ongoing — order verified from
+  # sp_etl_run_wf_TRS_Stage_Load_1_Ongoing.sql (14 drivers).
+  # TRS has NO Validation driver, hence NO valexc phase.
+  # ----------------------------------------------------------------
+  - id: TRS_ONGOING
+    source: TRS
+    steps:
+      - id: TRS_PTY_ONGOING
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_OnGoing
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_OnGoing
+        enabled: true
+        phases: [loader, enrich, exc]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: TRS_PTY_DEACTIVATION_1
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Deactivation_1
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Deactivation_1
+        enabled: true
+        phases: [loader]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: TRS_PTY_RLE_TOA
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_TOA
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_TOA
+        enabled: true
+        phases: [loader, exc]
+        touches: [TOA]
+        rerunSafety: SAFE
+      - id: TRS_REL_1_MEM_TO_MEM
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_Rel_1_Mem_To_Mem
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_Rel_1_Mem_To_Mem
+        enabled: true
+        phases: [loader, exc]
+        touches: [REL]
+        rerunSafety: SAFE
+      - id: TRS_REL_DEACTIVATION_1
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_Rel_DeActivation_1
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_Rel_DeActivation_1
+        enabled: true
+        phases: [loader]
+        touches: [REL]
+        rerunSafety: SAFE
+      - id: TRS_REL_2_MEM_TO_PCP
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_Rel_2_Mem_To_PCP
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_Rel_2_Mem_To_PCP
+        enabled: true
+        phases: [loader, exc]
+        touches: [REL]
+        rerunSafety: SAFE
+      - id: TRS_PHN_AND_EADDR
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_Phn_And_EAddr
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_Phn_And_EAddr
+        enabled: true
+        phases: [loader, enrich, exc]
+        touches: [PHN, EADDR]
+        rerunSafety: SAFE
+      - id: TRS_MNG_ATTR_SW
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Mng_Attr_Sw
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Mng_Attr_Sw
+        enabled: true
+        phases: [loader]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: TRS_MNG_ATTR_AUTH_REP_ONGOING
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Mng_Attr_Auth_Rep_Ongoing
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Mng_Attr_Auth_Rep_Ongoing
+        enabled: true
+        phases: [loader]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: TRS_PTY_NM
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Nm
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Nm
+        enabled: true
+        phases: [loader]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: TRS_PTY_RLE_ALT_ID
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_Alt_Id
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_Alt_Id
+        enabled: true
+        phases: [loader, exc]
+        touches: [ALT_ID]
+        rerunSafety: SAFE
+      - id: TRS_PTY_RLE_PLN
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_Pln
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Pty_Rle_Pln
+        enabled: true
+        phases: [loader, exc]
+        touches: [PLN]
+        rerunSafety: SAFE
+      - id: TRS_ADDR_1
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Addr_1
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Addr_1
+        enabled: true
+        phases: [loader]
+        touches: [ADR]
+        rerunSafety: SAFE
+      - id: TRS_ADDR_2
+        # The TRS DQM writer: this driver (not Addr_1) calls
+        # adr_dqm + adr_exc, so it is the APPEND risk on re-run.
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Addr_2
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Addr_2
+        enabled: true
+        phases: [loader, exc, dqm]
+        touches: [ADR]
+        rerunSafety: APPEND
+
+  # ----------------------------------------------------------------
+  # TRS TOA — single-driver workflow from
+  # sp_etl_run_wf_TRS_Stage_Load_TOA.sql.
+  # ----------------------------------------------------------------
+  - id: TRS_TOA
+    source: TRS
+    steps:
+      - id: TRS_STG_TOA
+        procedure: sp_snow_main_m_Tgt_C_S_TRS_Stg_TOA
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TRS_Stg_TOA
+        enabled: true
+        phases: [loader]
+        touches: [TOA]
+        rerunSafety: SAFE
+
+  # ----------------------------------------------------------------
+  # ECI — order verified from sp_etl_run_wf_ECI_Stage_Load.sql.
+  # Validation driver runs first, and valexc runs inside it.
+  # ----------------------------------------------------------------
+  - id: ECI_STAGE_LOAD
+    source: ECI
+    steps:
+      - id: ECI_PTY_VALIDATION
+        # valexc runs inside this driver, not as its own CALL.
+        procedure: sp_snow_main_m_Tgt_C_S_ECI_Pty_Validation
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_ECI_Pty_Validation
+        enabled: true
+        phases: [valexc]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: ECI_PTY
+        procedure: sp_snow_main_m_Tgt_C_S_ECI_Pty
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_ECI_Pty
+        enabled: true
+        phases: [loader, enrich, exc]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: ECI_REACTIVATION_FAMILY_ADDR
+        procedure: sp_snow_main_m_Tgt_Stg_ECI_Pty_Reactivation_D_Family_Addr
+        oracleProcedure: sp_snow_main_m_Tgt_Stg_ECI_Pty_Reactivation_D_Family_Addr
+        enabled: true
+        phases: [loader]
+        touches: [ADR]
+        rerunSafety: SAFE
+      - id: ECI_REACTIVATION_FAMILY_PHN
+        procedure: sp_snow_main_m_Tgt_Stg_ECI_Pty_Reactivation_D_Family_Phn
+        oracleProcedure: sp_snow_main_m_Tgt_Stg_ECI_Pty_Reactivation_D_Family_Phn
+        enabled: true
+        phases: [loader]
+        touches: [PHN]
+        rerunSafety: SAFE
+      - id: ECI_REACTIVATION_MEDICAID
+        procedure: sp_snow_main_m_Tgt_Stg_ECI_Pty_Reactivation_D_Medicaid
+        oracleProcedure: sp_snow_main_m_Tgt_Stg_ECI_Pty_Reactivation_D_Medicaid
+        enabled: true
+        phases: [loader]
+        touches: [ALT_ID]
+        rerunSafety: SAFE
+      - id: ECI_PTY_RLE_ALT_ID
+        procedure: sp_snow_main_m_Tgt_C_S_ECI_Pty_Rle_Alt_Id
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_ECI_Pty_Rle_Alt_Id
+        enabled: true
+        phases: [loader, exc]
+        touches: [ALT_ID]
+        rerunSafety: SAFE
+      - id: ECI_PHN_AND_EADDR
+        procedure: sp_snow_main_m_Tgt_C_S_ECI_Pty_Rle_Phn_And_EAddr
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_ECI_Pty_Rle_Phn_And_EAddr
+        enabled: true
+        phases: [loader, enrich, exc]
+        touches: [PHN, EADDR]
+        rerunSafety: SAFE
+      - id: ECI_PTY_ADDR
+        procedure: sp_snow_main_m_Tgt_C_S_ECI_Pty_Addr
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_ECI_Pty_Addr
+        enabled: true
+        phases: [loader, exc, dqm]
+        touches: [ADR]
+        rerunSafety: APPEND
+      - id: ECI_PTY_RLE_REL
+        procedure: sp_snow_main_m_Tgt_C_S_ECI_Pty_Rle_Rel
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_ECI_Pty_Rle_Rel
+        enabled: true
+        phases: [loader, exc]
+        touches: [REL]
+        rerunSafety: SAFE
+
+  # ----------------------------------------------------------------
+  # FSS — order verified from sp_etl_run_wf_FSS_Stage_Load.sql.
+  # ----------------------------------------------------------------
+  - id: FSS_STAGE_LOAD
+    source: FSS
+    steps:
+      - id: FSS_PTY_VALIDATION
+        procedure: sp_snow_main_m_Tgt_C_S_FSS_Pty_Validation
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_FSS_Pty_Validation
+        enabled: true
+        phases: [valexc]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: FSS_PTY
+        procedure: sp_snow_main_m_Tgt_C_S_FSS_Pty
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_FSS_Pty
+        enabled: true
+        phases: [loader, enrich, exc]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: FSS_PTY_ADDR
+        procedure: sp_snow_main_m_Tgt_C_S_FSS_Pty_Addr
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_FSS_Pty_Addr
+        enabled: true
+        phases: [loader, exc, dqm]
+        touches: [ADR]
+        rerunSafety: APPEND
+      - id: FSS_PTY_RLE_ALT_ID
+        # Loader-only: this driver calls no common pass.
+        procedure: sp_snow_main_m_Tgt_C_S_FSS_Pty_Rle_Alt_Id
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_FSS_Pty_Rle_Alt_Id
+        enabled: true
+        phases: [loader]
+        touches: [ALT_ID]
+        rerunSafety: SAFE
+      - id: FSS_PHN_AND_EADDR
+        procedure: sp_snow_main_m_Tgt_C_S_FSS_Pty_Rle_Phn_And_EAddr
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_FSS_Pty_Rle_Phn_And_EAddr
+        enabled: true
+        phases: [loader, enrich, exc]
+        touches: [PHN, EADDR]
+        rerunSafety: SAFE
+      - id: FSS_PTY_RLE_REL
+        procedure: sp_snow_main_m_Tgt_C_S_FSS_Pty_Rle_Rel
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_FSS_Pty_Rle_Rel
+        enabled: true
+        phases: [loader, exc]
+        touches: [REL]
+        rerunSafety: SAFE
+
+  # ----------------------------------------------------------------
+  # WIC — order verified from sp_etl_run_wf_WIC_Stage_Load.sql.
+  # ----------------------------------------------------------------
+  - id: WIC_STAGE_LOAD
+    source: WIC
+    steps:
+      - id: WIC_PTY_VALIDATION
+        procedure: sp_snow_main_m_Tgt_C_S_WIC_Pty_Validation
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_WIC_Pty_Validation
+        enabled: true
+        phases: [valexc]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: WIC_PTY
+        procedure: sp_snow_main_m_Tgt_C_S_WIC_Pty
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_WIC_Pty
+        enabled: true
+        phases: [loader, enrich, exc]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: WIC_PTY_ADDR
+        procedure: sp_snow_main_m_Tgt_C_S_WIC_Pty_Addr
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_WIC_Pty_Addr
+        enabled: true
+        phases: [loader, exc, dqm]
+        touches: [ADR]
+        rerunSafety: APPEND
+      - id: WIC_PHN_AND_EADDR
+        procedure: sp_snow_main_m_Tgt_C_S_WIC_Pty_Rle_Phn_And_EAddr
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_WIC_Pty_Rle_Phn_And_EAddr
+        enabled: true
+        phases: [loader, enrich, exc]
+        touches: [PHN, EADDR]
+        rerunSafety: SAFE
+      - id: WIC_PTY_RLE_ALT_ID
+        # Loader-only: this driver calls no common pass.
+        procedure: sp_snow_main_m_Tgt_C_S_WIC_Pty_Rle_Alt_Id
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_WIC_Pty_Rle_Alt_Id
+        enabled: true
+        phases: [loader]
+        touches: [ALT_ID]
+        rerunSafety: SAFE
+
+  # ----------------------------------------------------------------
+  # TTF — order verified from sp_etl_run_wf_TTF_Stage_Load.sql.
+  # NOTE: TTF has NO address or email driver in its runner
+  # (only Pty, Alt_Id, Phn), so the TTF sketch has no Address
+  # or Email classes — only Party, Phone, AltId. TTF also has
+  # no dqm phase (no ADR loader, no adr_dqm call anywhere).
+  # ----------------------------------------------------------------
+  - id: TTF_STAGE_LOAD
+    source: TTF
+    steps:
+      - id: TTF_PTY_VALIDATION
+        procedure: sp_snow_main_m_Tgt_C_S_TTF_Pty_Validation
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TTF_Pty_Validation
+        enabled: true
+        phases: [valexc]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: TTF_PTY
+        procedure: sp_snow_main_m_Tgt_C_S_TTF_Pty
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TTF_Pty
+        enabled: true
+        phases: [loader, enrich, exc]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: TTF_PTY_RLE_ALT_ID
+        # Loader-only: this driver calls no common pass.
+        procedure: sp_snow_main_m_Tgt_C_S_TTF_Pty_Rle_Alt_Id
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TTF_Pty_Rle_Alt_Id
+        enabled: true
+        phases: [loader]
+        touches: [ALT_ID]
+        rerunSafety: SAFE
+      - id: TTF_PTY_RLE_PHN
+        procedure: sp_snow_main_m_Tgt_C_S_TTF_Pty_Rle_Phn
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_TTF_Pty_Rle_Phn
+        enabled: true
+        phases: [loader, enrich, exc]
+        touches: [PHN]
+        rerunSafety: SAFE
+
+  # ----------------------------------------------------------------
+  # CRE — single driver from
+  # sp_etl_run_wf_CRE_Stage_Load_Ongoing.sql. One step, but it
+  # spans five dimensions (see touches) and carries the 45
+  # minute timeout: the CRE loader was observed taking ~15
+  # minutes on the scratch warehouse, so the timeout stays
+  # generous. CRE has no Validation driver (no valexc) and no
+  # dqm call (adr_exc only, which is exc, not dqm).
+  # ----------------------------------------------------------------
+  - id: CRE_STAGE_LOAD_ONGOING
+    source: CRE
+    steps:
+      - id: CRE_CARE_CLIENTS
+        procedure: sp_snow_main_m_Tgt_C_S_CRE_CARE_Clients
+        oracleProcedure: sp_snow_main_m_Tgt_C_S_CRE_CARE_Clients
+        enabled: true
+        phases: [loader, enrich, exc]
+        touches: [PTY, RLE, ADR, PHN, ALT_ID]
+        rerunSafety: SAFE
+        timeoutMinutes: 45

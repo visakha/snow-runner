@@ -1,0 +1,20 @@
+package com.visakha.snowrunner.wic.loader;
+
+import com.visakha.snowrunner.catalog.Phase;
+import com.visakha.snowrunner.domain.Dimension;
+import com.visakha.snowrunner.domain.Source;
+import com.visakha.snowrunner.execution.BasePhaseHandler;
+import java.util.Set;
+import org.springframework.stereotype.Component;
+
+/**
+ * WIC Address slice of the loader phase. The driver CALL owns the work; this class only attaches
+ * phase ownership. Constitution stage: spine — this phase lands rows on C_S_*.
+ */
+@Component
+public class WicAddressLoader extends BasePhaseHandler {
+  /** Creates the handler. */
+  public WicAddressLoader() {
+    super(Source.WIC, Phase.LOADER, Set.of(Dimension.ADR));
+  }
+}

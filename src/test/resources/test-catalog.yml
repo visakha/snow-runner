@@ -1,0 +1,51 @@
+# Small catalog for tests: one workflow, three steps, one disabled.
+catalogVersion: 0.1-test
+targetDatabase: snowflake
+
+schemas:
+  snowflake:
+    TRS: TRS_ETL_WRK
+  oracle:
+    TRS: DUMMY_ORA_TRS_WRK
+
+databases:
+  snowflake:
+    driverClass: net.snowflake.client.jdbc.SnowflakeDriver
+    urlTemplate: jdbc:snowflake://DUMMY_ACCOUNT.snowflakecomputing.com
+    auth: key-pair
+  oracle:
+    driverClass: oracle.jdbc.OracleDriver
+    urlTemplate: jdbc:oracle:thin:@DUMMY_HOST.invalid:1521/DUMMY_SERVICE
+    auth: username-password
+
+defaults:
+  timeoutMinutes: 30
+  parameters:
+    P_RUN_TS: $RUN_TIMESTAMP
+    P_SOURCE: $SOURCE
+
+workflows:
+  - id: TRS_ONGOING
+    source: TRS
+    steps:
+      - id: TRS_PTY_ONGOING
+        procedure: sp_test_pty
+        oracleProcedure: DUMMY_ORA_TRS_PTY_ONGOING
+        enabled: true
+        phases: [loader, enrich, exc]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: TRS_DISABLED_STEP
+        procedure: sp_test_disabled
+        oracleProcedure: DUMMY_ORA_TRS_DISABLED_STEP
+        enabled: false
+        phases: [loader]
+        touches: [PTY]
+        rerunSafety: SAFE
+      - id: TRS_ADDR_2
+        procedure: sp_test_addr
+        oracleProcedure: DUMMY_ORA_TRS_ADDR_2
+        enabled: true
+        phases: [loader, exc, dqm]
+        touches: [ADR]
+        rerunSafety: APPEND

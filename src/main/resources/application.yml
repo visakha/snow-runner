@@ -1,0 +1,55 @@
+# snow-runner application configuration.
+#
+# PLACEHOLDERS ONLY. No real hosts, accounts, users, or secrets live
+# here. Real values come from environment variables (or a vault) at
+# deployment time; the ${...:...} defaults below are dummies that fail
+# fast if the operator forgets to set them.
+#
+# The catalog (steps-catalog.yml) is a separate document: it holds
+# procedure names and order, never connection details.
+
+snowrunner:
+  catalog:
+    location: classpath:steps-catalog.yml
+    # Which Snowflake tree the procedures came from (base v3 vs the
+    # TYPE-FIX line). Open 007 item: confirm the tree target.
+    tree-version: v3
+  # Control tables (RUN, RUN_STEP). Production home per 005 §7 is
+  # MDM_ETL_RUNNER.CONTROL; the database name still needs the user's
+  # confirmation, so this stays a plain configurable connection.
+  control:
+    url: ${SNOWRUNNER_CONTROL_URL:jdbc:snowflake://DUMMY_ACCOUNT.snowflakecomputing.com/DUMMY_DB?schema=CONTROL}
+    username: ${SNOWRUNNER_CONTROL_USER:DUMMY_USER}
+    password: ${SNOWRUNNER_CONTROL_PASSWORD:}
+    driver-class-name: ${SNOWRUNNER_CONTROL_DRIVER:net.snowflake.client.jdbc.SnowflakeDriver}
+  # ETL target connections. Exactly one is used, chosen by the
+  # catalog's targetDatabase flag at startup.
+  snowflake:
+    url: ${SNOWRUNNER_SNOWFLAKE_URL:jdbc:snowflake://DUMMY_ACCOUNT.snowflakecomputing.com/DUMMY_DB}
+    username: ${SNOWRUNNER_SNOWFLAKE_USER:DUMMY_USER}
+    password: ${SNOWRUNNER_SNOWFLAKE_PASSWORD:}
+    driver-class-name: net.snowflake.client.jdbc.SnowflakeDriver
+  oracle:
+    url: ${SNOWRUNNER_ORACLE_URL:jdbc:oracle:thin:@DUMMY_HOST.invalid:1521/DUMMY_SERVICE}
+    username: ${SNOWRUNNER_ORACLE_USER:DUMMY_USER}
+    password: ${SNOWRUNNER_ORACLE_PASSWORD:}
+    driver-class-name: oracle.jdbc.OracleDriver
+
+spring:
+  application:
+    name: snow-runner
+  # No spring.datasource.* block on purpose: the two DataSources are
+  # built explicitly in DataSourceConfiguration so the control store
+  # and the ETL target stay separate connections.
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, metrics, prometheus
+  endpoint:
+    health:
+      show-details: never

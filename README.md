@@ -62,3 +62,44 @@ What IS important here is observability, and that is specified in
 004_OBSERVABILITY.md: CLI and REST as the touch points, plus
 Azure-native logging, metrics, tracing, health, and alerting, so
 there is a live view of the application during runtime.
+
+## Code
+
+The Java codebase now lives at the repo root (Maven single module,
+Java 27, Spring Boot 4.1.2, Spring Data JDBC). The spec-first hold
+above was overridden by direct order on 2026-10-30 for the Java
+code only — code existing does not mean the open decisions are
+settled. The 007 decisions round (control-table database name,
+auth mechanism, dry-run role, idempotency-key format, target tree,
+and the rest) remains open, and `BUILD_NOTES.md` records the
+assumption made for each one.
+
+```bash
+mvn verify   # tests + Spotless + Checkstyle, all build-failing
+```
+
+What the code implements, and what it does not:
+
+- It calls the 40 drivers in catalog order (YAML-driven, from
+  `src/main/resources/steps-catalog.yml`), one driver CALL per
+  step, sequential and fail-fast. It holds no ETL logic.
+- Code comments cite the clean-ETL constitution
+  (`docs/constitution/`) at every seam where it bites: stateless
+  runs, boundaries Java never crosses (no `C_S_*` / `V_*` reads,
+  no spine-predicate evaluation), and names that say source,
+  dimension, and phase. No class or variable renames were needed
+  in that pass — the tree already named source, dimension, and
+  phase everywhere, which is the constitution's naming rule.
+- The constitution's run-start bookends (drop work tables,
+  truncate `C_S_*` tables) are NOT implemented in the app or in
+  the drivers: both sides append today. Until the bookends land,
+  resume — never re-trigger — is the recovery path. See the user
+  guide's constitution section and the DevOps guide §13.
+- Verified with mock data only (30/30 tests). No live Snowflake
+  or Oracle run has been made from this codebase; the Oracle
+  mirror is statically verified only and ships separately.
+
+Operator docs: [docs/guides/USER_GUIDE.md](docs/guides/USER_GUIDE.md)
+and [docs/guides/DEVOPS_GUIDE.md](docs/guides/DEVOPS_GUIDE.md).
+Philosophy: [docs/constitution/clean-etl-constitution-guide.md](docs/constitution/clean-etl-constitution-guide.md)
+and the deck in the same folder.
